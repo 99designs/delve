@@ -10,3 +10,5 @@ localtests
 *.iml
 .teamcity/target
 .vscode
+
+dist/
