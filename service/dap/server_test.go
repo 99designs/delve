@@ -55,38 +55,46 @@ func TestMain(m *testing.M) {
 
 // name is for _fixtures/<name>.go
 func runTest(t *testing.T, name string, test func(c *daptest.Client, f protest.Fixture)) {
-	runTestBuildFlags(t, name, test, protest.AllNonOptimized)
+	runTestBuildFlags(t, name, test, protest.AllNonOptimized, false)
 }
 
 // name is for _fixtures/<name>.go
-func runTestBuildFlags(t *testing.T, name string, test func(c *daptest.Client, f protest.Fixture), buildFlags protest.BuildFlags) {
+func runTestBuildFlags(t *testing.T, name string, test func(c *daptest.Client, f protest.Fixture), buildFlags protest.BuildFlags, defaultDebugInfoDirs bool) {
 	fixture := protest.BuildFixture(name, buildFlags)
 
 	// Start the DAP server.
 	serverStopped := make(chan struct{})
-	client := startDAPServerWithClient(t, serverStopped)
+	client := startDAPServerWithClient(t, defaultDebugInfoDirs, serverStopped)
 	defer client.Close()
 
 	test(client, fixture)
 	<-serverStopped
 }
 
-func startDAPServerWithClient(t *testing.T, serverStopped chan struct{}) *daptest.Client {
-	server, _ := startDAPServer(t, serverStopped)
+func startDAPServerWithClient(t *testing.T, defaultDebugInfoDirs bool, serverStopped chan struct{}) *daptest.Client {
+	server, _ := startDAPServer(t, defaultDebugInfoDirs, serverStopped)
 	client := daptest.NewClient(server.config.Listener.Addr().String())
 	return client
 }
 
-func startDAPServer(t *testing.T, serverStopped chan struct{}) (server *Server, forceStop chan struct{}) {
+// Starts an empty server and a stripped down config just to establish a client connection.
+// To mock a server created by dap.NewServer(config) or serving dap.NewSession(conn, config, debugger)
+// set those arg fields manually after the server creation.
+func startDAPServer(t *testing.T, defaultDebugInfoDirs bool, serverStopped chan struct{}) (server *Server, forceStop chan struct{}) {
 	// Start the DAP server.
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	debugInfoDirs := []string{}
+	if defaultDebugInfoDirs {
+		debugInfoDirs = []string{"/usr/lib/debug/.build-id"}
+	}
 	disconnectChan := make(chan struct{})
 	server = NewServer(&service.Config{
 		Listener:       listener,
 		DisconnectChan: disconnectChan,
+		Debugger:       debugger.Config{DebugInfoDirectories: debugInfoDirs},
 	})
 	server.Run()
 	// Give server time to start listening for clients
@@ -103,8 +111,10 @@ func startDAPServer(t *testing.T, serverStopped chan struct{}) (server *Server, 
 			}
 		}()
 		select {
-		case <-disconnectChan: // Stop triggered internally
-		case <-forceStop: // Stop triggered externally
+		case <-disconnectChan:
+			t.Log("server stop triggered internally")
+		case <-forceStop:
+			t.Log("server stop triggered externally")
 		}
 		server.Stop()
 	}()
@@ -153,7 +163,7 @@ func TestStopNoClient(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			serverStopped := make(chan struct{})
-			server, forceStop := startDAPServer(t, serverStopped)
+			server, forceStop := startDAPServer(t, false, serverStopped)
 			triggerStop(server, forceStop)
 			<-serverStopped
 			verifyServerStopped(t, server)
@@ -169,7 +179,7 @@ func TestStopNoTarget(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			serverStopped := make(chan struct{})
-			server, forceStop := startDAPServer(t, serverStopped)
+			server, forceStop := startDAPServer(t, false, serverStopped)
 			client := daptest.NewClient(server.config.Listener.Addr().String())
 			defer client.Close()
 
@@ -196,7 +206,7 @@ func TestStopWithTarget(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			serverStopped := make(chan struct{})
-			server, forceStop := startDAPServer(t, serverStopped)
+			server, forceStop := startDAPServer(t, false, serverStopped)
 			client := daptest.NewClient(server.config.Listener.Addr().String())
 			defer client.Close()
 
@@ -299,7 +309,7 @@ func TestSessionStop(t *testing.T) {
 
 func TestForceStopWhileStopping(t *testing.T) {
 	serverStopped := make(chan struct{})
-	server, forceStop := startDAPServer(t, serverStopped)
+	server, forceStop := startDAPServer(t, false, serverStopped)
 	client := daptest.NewClient(server.config.Listener.Addr().String())
 
 	client.InitializeRequest()
@@ -316,37 +326,39 @@ func TestForceStopWhileStopping(t *testing.T) {
 
 // TestLaunchStopOnEntry emulates the message exchange that can be observed with
 // VS Code for the most basic launch debug session with "stopOnEntry" enabled:
-// - User selects "Start Debugging":  1 >> initialize
-//                                 :  1 << initialize
-//                                 :  2 >> launch
-//                                 :    << initialized event
-//                                 :  2 << launch
-//                                 :  3 >> setBreakpoints (empty)
-//                                 :  3 << setBreakpoints
-//                                 :  4 >> setExceptionBreakpoints (empty)
-//                                 :  4 << setExceptionBreakpoints
-//                                 :  5 >> configurationDone
-// - Program stops upon launching  :    << stopped event
-//                                 :  5 << configurationDone
-//                                 :  6 >> threads
-//                                 :  6 << threads (Dummy)
-//                                 :  7 >> threads
-//                                 :  7 << threads (Dummy)
-//                                 :  8 >> stackTrace
-//                                 :  8 << error (Unable to produce stack trace)
-//                                 :  9 >> stackTrace
-//                                 :  9 << error (Unable to produce stack trace)
-// - User evaluates bad expression : 10 >> evaluate
-//                                 : 10 << error (unable to find function context)
-// - User evaluates good expression: 11 >> evaluate
-//                                 : 11 << evaluate
-// - User selects "Continue"       : 12 >> continue
-//                                 : 12 << continue
-// - Program runs to completion    :    << terminated event
-//                                 : 13 >> disconnect
-//                                 :    << output event (Process exited)
-//                                 :    << output event (Detaching)
-//                                 : 13 << disconnect
+//
+//	User selects "Start Debugging":  1 >> initialize
+//	                              :  1 << initialize
+//	                              :  2 >> launch
+//	                              :    << initialized event
+//	                              :  2 << launch
+//	                              :  3 >> setBreakpoints (empty)
+//	                              :  3 << setBreakpoints
+//	                              :  4 >> setExceptionBreakpoints (empty)
+//	                              :  4 << setExceptionBreakpoints
+//	                              :  5 >> configurationDone
+//	Program stops upon launching  :    << stopped event
+//	                              :  5 << configurationDone
+//	                              :  6 >> threads
+//	                              :  6 << threads (Dummy)
+//	                              :  7 >> threads
+//	                              :  7 << threads (Dummy)
+//	                              :  8 >> stackTrace
+//	                              :  8 << error (Unable to produce stack trace)
+//	                              :  9 >> stackTrace
+//	                              :  9 << error (Unable to produce stack trace)
+//	User evaluates bad expression : 10 >> evaluate
+//	                              : 10 << error (unable to find function context)
+//	User evaluates good expression: 11 >> evaluate
+//	                              : 11 << evaluate
+//	User selects "Continue"       : 12 >> continue
+//	                              : 12 << continue
+//	Program runs to completion    :    << terminated event
+//	                              : 13 >> disconnect
+//	                              :    << output event (Process exited)
+//	                              :    << output event (Detaching)
+//	                              : 13 << disconnect
+//
 // This test exhaustively tests Seq and RequestSeq on all messages from the
 // server. Other tests do not necessarily need to repeat all these checks.
 func TestLaunchStopOnEntry(t *testing.T) {
@@ -796,11 +808,12 @@ func TestPreSetBreakpoint(t *testing.T) {
 }
 
 // checkStackFramesExact is a helper for verifying the values within StackTraceResponse.
-//     wantStartName - name of the first returned frame (ignored if "")
-//     wantStartLine - file line of the first returned frame (ignored if <0).
-//     wantStartID - id of the first frame returned (ignored if wantFrames is 0).
-//     wantFrames - number of frames returned (length of StackTraceResponse.Body.StackFrames array).
-//     wantTotalFrames - total number of stack frames available (StackTraceResponse.Body.TotalFrames).
+//
+//	wantStartName - name of the first returned frame (ignored if "")
+//	wantStartLine - file line of the first returned frame (ignored if <0).
+//	wantStartID - id of the first frame returned (ignored if wantFrames is 0).
+//	wantFrames - number of frames returned (length of StackTraceResponse.Body.StackFrames array).
+//	wantTotalFrames - total number of stack frames available (StackTraceResponse.Body.TotalFrames).
 func checkStackFramesExact(t *testing.T, got *dap.StackTraceResponse,
 	wantStartName string, wantStartLine, wantStartID, wantFrames, wantTotalFrames int) {
 	t.Helper()
@@ -951,9 +964,10 @@ func checkStackFramesNamed(testName string, t *testing.T, got *dap.StackTraceRes
 }
 
 // checkScope is a helper for verifying the values within a ScopesResponse.
-//     i - index of the scope within ScopesRespose.Body.Scopes array
-//     name - name of the scope
-//     varRef - reference to retrieve variables of this scope. If varRef is negative, the reference is not checked.
+//
+//	i - index of the scope within ScopesRespose.Body.Scopes array
+//	name - name of the scope
+//	varRef - reference to retrieve variables of this scope. If varRef is negative, the reference is not checked.
 func checkScope(t *testing.T, got *dap.ScopesResponse, i int, name string, varRef int) {
 	t.Helper()
 	if len(got.Body.Scopes) <= i {
@@ -966,8 +980,9 @@ func checkScope(t *testing.T, got *dap.ScopesResponse, i int, name string, varRe
 }
 
 // checkChildren is a helper for verifying the number of variables within a VariablesResponse.
-//      parentName - pseudoname of the enclosing variable or scope (used for error message only)
-//      numChildren - number of variables/fields/elements of this variable
+//
+//	parentName - pseudoname of the enclosing variable or scope (used for error message only)
+//	numChildren - number of variables/fields/elements of this variable
 func checkChildren(t *testing.T, got *dap.VariablesResponse, parentName string, numChildren int) {
 	t.Helper()
 	if got.Body.Variables == nil {
@@ -979,13 +994,14 @@ func checkChildren(t *testing.T, got *dap.VariablesResponse, parentName string, 
 }
 
 // checkVar is a helper for verifying the values within a VariablesResponse.
-//     i - index of the variable within VariablesRespose.Body.Variables array (-1 will search all vars for a match)
-//     name - name of the variable
-//     evalName - fully qualified variable name or alternative expression to load this variable
-//     value - the value of the variable
-//     useExactMatch - true if name, evalName and value are to be compared to exactly, false if to be used as regex
-//     hasRef - true if the variable should have children and therefore a non-0 variable reference
-//     ref - reference to retrieve children of this variable (0 if none)
+//
+//	i - index of the variable within VariablesRespose.Body.Variables array (-1 will search all vars for a match)
+//	name - name of the variable
+//	evalName - fully qualified variable name or alternative expression to load this variable
+//	value - the value of the variable
+//	useExactMatch - true if name, evalName and value are to be compared to exactly, false if to be used as regex
+//	hasRef - true if the variable should have children and therefore a non-0 variable reference
+//	ref - reference to retrieve children of this variable (0 if none)
 func checkVar(t *testing.T, got *dap.VariablesResponse, i int, name, evalName, value, typ string, useExactMatch, hasRef bool, indexed, named int) (ref int) {
 	t.Helper()
 	if len(got.Body.Variables) <= i {
@@ -1939,7 +1955,7 @@ func TestScopesRequestsOptimized(t *testing.T) {
 				disconnect: false,
 			}})
 	},
-		protest.EnableOptimization)
+		protest.EnableOptimization, false)
 }
 
 // TestVariablesLoading exposes test cases where variables might be partially or
@@ -1962,6 +1978,10 @@ func TestVariablesLoading(t *testing.T) {
 					saveDefaultConfig := DefaultLoadConfig
 					DefaultLoadConfig.MaxStructFields = 5
 					DefaultLoadConfig.MaxStringLen = 64
+					// Set the MaxArrayValues = 33 to execute a bug for map handling where
+					// a request for  2*MaxArrayValues indexed map children would not correctly
+					// reslice the map. See https://github.com/golang/vscode-go/issues/2351.
+					DefaultLoadConfig.MaxArrayValues = 33
 					defer func() {
 						DefaultLoadConfig = saveDefaultConfig
 					}()
@@ -1991,11 +2011,11 @@ func TestVariablesLoading(t *testing.T) {
 
 					// Array not fully loaded based on LoadConfig.MaxArrayValues.
 					// Expect to be able to load array by paging.
-					ref := checkVarExactIndexed(t, locals, -1, "longarr", "longarr", "[100]int [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+36 more]", "[100]int", hasChildren, 100, 0)
+					ref := checkVarExactIndexed(t, locals, -1, "longarr", "longarr", "[100]int [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+67 more]", "[100]int", hasChildren, 100, 0)
 					if ref > 0 {
 						client.VariablesRequest(ref)
 						longarr := client.ExpectVariablesResponse(t)
-						checkChildren(t, longarr, "longarr", 64)
+						checkChildren(t, longarr, "longarr", 33)
 						checkArrayChildren(t, longarr, "longarr", 0)
 
 						client.IndexedVariablesRequest(ref, 0, 100)
@@ -2011,11 +2031,11 @@ func TestVariablesLoading(t *testing.T) {
 
 					// Slice not fully loaded based on LoadConfig.MaxArrayValues.
 					// Expect to be able to load slice by paging.
-					ref = checkVarExactIndexed(t, locals, -1, "longslice", "longslice", "[]int len: 100, cap: 100, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+36 more]", "[]int", hasChildren, 100, 0)
+					ref = checkVarExactIndexed(t, locals, -1, "longslice", "longslice", "[]int len: 100, cap: 100, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,...+67 more]", "[]int", hasChildren, 100, 0)
 					if ref > 0 {
 						client.VariablesRequest(ref)
 						longarr := client.ExpectVariablesResponse(t)
-						checkChildren(t, longarr, "longslice", 64)
+						checkChildren(t, longarr, "longslice", 33)
 						checkArrayChildren(t, longarr, "longslice", 0)
 
 						client.IndexedVariablesRequest(ref, 0, 100)
@@ -2035,7 +2055,7 @@ func TestVariablesLoading(t *testing.T) {
 					if ref > 0 {
 						client.VariablesRequest(ref)
 						m1 := client.ExpectVariablesResponse(t)
-						checkChildren(t, m1, "m1", 65)
+						checkChildren(t, m1, "m1", 34)
 
 						client.IndexedVariablesRequest(ref, 0, 66)
 						m1 = client.ExpectVariablesResponse(t)
@@ -2145,7 +2165,7 @@ func TestVariablesLoading(t *testing.T) {
 							if ref > 0 {
 								client.VariablesRequest(ref)
 								tmV0 := client.ExpectVariablesResponse(t)
-								checkChildren(t, tmV0, "tm.v[0]", 65)
+								checkChildren(t, tmV0, "tm.v[0]", 34)
 							}
 						}
 					}
@@ -2175,7 +2195,7 @@ func TestVariablesLoading(t *testing.T) {
 								if ref > 0 {
 									client.VariablesRequest(ref)
 									tmV0 := client.ExpectVariablesResponse(t)
-									checkChildren(t, tmV0, "tm.v[0]", 65)
+									checkChildren(t, tmV0, "tm.v[0]", 34)
 								}
 							}
 						}
@@ -3286,6 +3306,39 @@ func TestLogPoints(t *testing.T) {
 	})
 }
 
+// TestLogPointsShowFullValue tests that log points will not truncate the string value.
+func TestLogPointsShowFullValue(t *testing.T) {
+	runTest(t, "longstrings", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{16},
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 16)
+					bps := []int{19}
+					logMessages := map[int]string{19: "{&s4097}"}
+					client.SetBreakpointsRequestWithArgs(fixture.Source, bps, nil, nil, logMessages)
+					client.ExpectSetBreakpointsResponse(t)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+					checkLogMessage(t, client.ExpectOutputEvent(t), 1, "*\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...+3585 more\"", fixture.Source, 19)
+
+					se := client.ExpectStoppedEvent(t)
+					if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
+						t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
+					}
+					checkStop(t, client, 1, "main.main", 22)
+				},
+				disconnect: true,
+			}})
+	})
+}
+
 func checkLogMessage(t *testing.T, oe *dap.OutputEvent, goid int, text, path string, line int) {
 	t.Helper()
 	prefix := "> [Go "
@@ -3751,9 +3804,10 @@ func TestWorkingDir(t *testing.T) {
 }
 
 // checkEval is a helper for verifying the values within an EvaluateResponse.
-//     value - the value of the evaluated expression
-//     hasRef - true if the evaluated expression should have children and therefore a non-0 variable reference
-//     ref - reference to retrieve children of this evaluated expression (0 if none)
+//
+//	value - the value of the evaluated expression
+//	hasRef - true if the evaluated expression should have children and therefore a non-0 variable reference
+//	ref - reference to retrieve children of this evaluated expression (0 if none)
 func checkEval(t *testing.T, got *dap.EvaluateResponse, value string, hasRef bool) (ref int) {
 	t.Helper()
 	if got.Body.Result != value || (got.Body.VariablesReference > 0) != hasRef {
@@ -3763,9 +3817,10 @@ func checkEval(t *testing.T, got *dap.EvaluateResponse, value string, hasRef boo
 }
 
 // checkEvalIndexed is a helper for verifying the values within an EvaluateResponse.
-//     value - the value of the evaluated expression
-//     hasRef - true if the evaluated expression should have children and therefore a non-0 variable reference
-//     ref - reference to retrieve children of this evaluated expression (0 if none)
+//
+//	value - the value of the evaluated expression
+//	hasRef - true if the evaluated expression should have children and therefore a non-0 variable reference
+//	ref - reference to retrieve children of this evaluated expression (0 if none)
 func checkEvalIndexed(t *testing.T, got *dap.EvaluateResponse, value string, hasRef bool, indexed, named int) (ref int) {
 	t.Helper()
 	if got.Body.Result != value || (got.Body.VariablesReference > 0) != hasRef || got.Body.IndexedVariables != indexed || got.Body.NamedVariables != named {
@@ -3848,7 +3903,7 @@ func TestEvaluateRequest(t *testing.T) {
 					// Type casts between string, []byte and []rune
 					client.EvaluateRequest("[]byte(\"ABC€\")", 1000, "this context will be ignored")
 					got = client.ExpectEvaluateResponse(t)
-					checkEvalIndexed(t, got, "[]uint8 len: 6, cap: 6, [65,66,67,226,130,172]", noChildren, 6, 0)
+					checkEvalIndexed(t, got, "[]uint8 len: 6, cap: 6, [65,66,67,226,130,172]", noChildren, 6, 1)
 
 					// Struct member access (i.e. somevar.memberfield)
 					client.EvaluateRequest("ms.Nest.Level", 1000, "this context will be ignored")
@@ -5084,14 +5139,15 @@ type onBreakpoint struct {
 // runDebugSessionWithBPs is a helper for executing the common init and shutdown
 // sequences for a program that does not stop on entry
 // while specifying breakpoints and unique launch/attach criteria via parameters.
-//    cmd            - "launch" or "attach"
-//    cmdRequest     - a function that sends a launch or attach request,
-//                     so the test author has full control of its arguments.
-//                     Note that he rest of the test sequence assumes that
-//                     stopOnEntry is false.
-//     source        - source file path, needed to set breakpoints, "" if none to be set.
-//     breakpoints   - list of lines, where breakpoints are to be set
-//     onBPs         - list of test sequences to execute at each of the set breakpoints.
+//
+//	cmd            - "launch" or "attach"
+//	cmdRequest     - a function that sends a launch or attach request,
+//	                 so the test author has full control of its arguments.
+//	                 Note that he rest of the test sequence assumes that
+//	                 stopOnEntry is false.
+//	 source        - source file path, needed to set breakpoints, "" if none to be set.
+//	 breakpoints   - list of lines, where breakpoints are to be set
+//	 onBPs         - list of test sequences to execute at each of the set breakpoints.
 func runDebugSessionWithBPs(t *testing.T, client *daptest.Client, cmd string, cmdRequest func(), source string, breakpoints []int, onBPs []onBreakpoint) {
 	client.InitializeRequest()
 	client.ExpectInitializeResponseAndCapabilities(t)
@@ -5393,7 +5449,7 @@ func TestNoDebug_AcceptNoRequestsButDisconnect(t *testing.T) {
 
 func TestLaunchRequestWithRelativeBuildPath(t *testing.T) {
 	serverStopped := make(chan struct{})
-	client := startDAPServerWithClient(t, serverStopped)
+	client := startDAPServerWithClient(t, false, serverStopped)
 	defer client.Close()
 
 	fixdir := protest.FindFixturesDir()
@@ -5492,7 +5548,7 @@ func TestLaunchTestRequest(t *testing.T) {
 				defer os.Chdir(orgWD)
 			}
 			serverStopped := make(chan struct{})
-			client := startDAPServerWithClient(t, serverStopped)
+			client := startDAPServerWithClient(t, false, serverStopped)
 			defer client.Close()
 
 			runDebugSessionWithBPs(t, client, "launch",
@@ -5623,7 +5679,7 @@ func TestLaunchRequestWithEnv(t *testing.T) {
 			}
 
 			serverStopped := make(chan struct{})
-			client := startDAPServerWithClient(t, serverStopped)
+			client := startDAPServerWithClient(t, false, serverStopped)
 			defer client.Close()
 
 			runDebugSessionWithBPs(t, client, "launch", func() { // launch
@@ -6516,18 +6572,34 @@ func launchDebuggerWithTargetHalted(t *testing.T, fixture string) (*protest.Fixt
 	return &fixbin, dbg
 }
 
+func attachDebuggerWithTargetHalted(t *testing.T, fixture string) (*exec.Cmd, *debugger.Debugger) {
+	t.Helper()
+	fixbin := protest.BuildFixture(fixture, protest.AllNonOptimized)
+	cmd := execFixture(t, fixbin)
+	cfg := service.Config{Debugger: debugger.Config{Backend: "default", AttachPid: cmd.Process.Pid}}
+	dbg, err := debugger.New(&cfg.Debugger, nil) // debugger halts process on entry
+	if err != nil {
+		t.Fatal("failed to start debugger:", err)
+	}
+	return cmd, dbg
+}
+
 // runTestWithDebugger starts the server and sets its debugger, initializes a debug session,
 // runs test, then disconnects. Expects no running async handler at the end of test() (either
 // process is halted or debug session never launched.)
 func runTestWithDebugger(t *testing.T, dbg *debugger.Debugger, test func(c *daptest.Client)) {
 	serverStopped := make(chan struct{})
-	server, _ := startDAPServer(t, serverStopped)
+	server, _ := startDAPServer(t, false, serverStopped)
 	client := daptest.NewClient(server.listener.Addr().String())
 	time.Sleep(100 * time.Millisecond) // Give time for connection to be set as dap.Session
 	server.sessionMu.Lock()
 	if server.session == nil {
 		t.Fatal("DAP session is not ready")
 	}
+	// Mock dap.NewSession arguments, so
+	// this dap.Server can be used as a proxy for
+	// rpccommon.Server running dap.Session.
+	server.session.config.Debugger.AttachPid = dbg.AttachPid()
 	server.session.debugger = dbg
 	server.sessionMu.Unlock()
 	defer client.Close()
@@ -6537,7 +6609,7 @@ func runTestWithDebugger(t *testing.T, dbg *debugger.Debugger, test func(c *dapt
 	test(client)
 
 	client.DisconnectRequest()
-	if server.config.Debugger.AttachPid == 0 { // launched target
+	if dbg.AttachPid() == 0 { // launched target
 		client.ExpectOutputEventDetachingKill(t)
 	} else { // attached to target
 		client.ExpectOutputEventDetachingNoKill(t)
@@ -6548,9 +6620,24 @@ func runTestWithDebugger(t *testing.T, dbg *debugger.Debugger, test func(c *dapt
 	<-serverStopped
 }
 
-func TestAttachRemoteToHaltedTargetStopOnEntry(t *testing.T) {
+func TestAttachRemoteToDlvLaunchHaltedStopOnEntry(t *testing.T) {
 	// Halted + stop on entry
 	_, dbg := launchDebuggerWithTargetHalted(t, "increment")
+	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
+		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
+		client.ExpectInitializedEvent(t)
+		client.ExpectAttachResponse(t)
+		client.ConfigurationDoneRequest()
+		client.ExpectStoppedEvent(t)
+		client.ExpectConfigurationDoneResponse(t)
+	})
+}
+
+func TestAttachRemoteToDlvAttachHaltedStopOnEntry(t *testing.T) {
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "windows" {
+		t.SkipNow()
+	}
+	cmd, dbg := attachDebuggerWithTargetHalted(t, "http_server")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
 		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
 		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
@@ -6560,6 +6647,7 @@ func TestAttachRemoteToHaltedTargetStopOnEntry(t *testing.T) {
 		client.ExpectStoppedEvent(t)
 		client.ExpectConfigurationDoneResponse(t)
 	})
+	cmd.Process.Kill()
 }
 
 func TestAttachRemoteToHaltedTargetContinueOnEntry(t *testing.T) {
@@ -6567,7 +6655,6 @@ func TestAttachRemoteToHaltedTargetContinueOnEntry(t *testing.T) {
 	_, dbg := launchDebuggerWithTargetHalted(t, "http_server")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
 		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": false})
-		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		client.ConfigurationDoneRequest()
@@ -6584,7 +6671,6 @@ func TestAttachRemoteToRunningTargetStopOnEntry(t *testing.T) {
 	fixture, dbg := launchDebuggerWithTargetRunning(t, "loopprog")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
 		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
-		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		// Target is halted here
@@ -6604,7 +6690,6 @@ func TestAttachRemoteToRunningTargetContinueOnEntry(t *testing.T) {
 	fixture, dbg := launchDebuggerWithTargetRunning(t, "loopprog")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
 		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": false})
-		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		// Target is halted here
@@ -6616,6 +6701,60 @@ func TestAttachRemoteToRunningTargetContinueOnEntry(t *testing.T) {
 		client.ExpectStoppedEvent(t)
 		checkStop(t, client, 1, "main.loop", 8)
 	})
+}
+
+// MultiClientCloseServerMock mocks the rpccommon.Server using a dap.Server to exercise
+// the shutdown logic in dap.Session where it does NOT take down the server on close
+// in multi-client mode. (The dap mode of the rpccommon.Server is tested in dlv_test).
+// The dap.Server is a single-use server. Once its one and only session is closed,
+// the server and the target must be taken down manually for the test not to leak.
+type MultiClientCloseServerMock struct {
+	impl      *Server
+	debugger  *debugger.Debugger
+	forceStop chan struct{}
+	stopped   chan struct{}
+}
+
+func NewMultiClientCloseServerMock(t *testing.T, fixture string) *MultiClientCloseServerMock {
+	var s MultiClientCloseServerMock
+	s.stopped = make(chan struct{})
+	s.impl, s.forceStop = startDAPServer(t, false, s.stopped)
+	_, s.debugger = launchDebuggerWithTargetHalted(t, "http_server")
+	return &s
+}
+
+func (s *MultiClientCloseServerMock) acceptNewClient(t *testing.T) *daptest.Client {
+	client := daptest.NewClient(s.impl.listener.Addr().String())
+	time.Sleep(100 * time.Millisecond) // Give time for connection to be set as dap.Session
+	s.impl.sessionMu.Lock()
+	if s.impl.session == nil {
+		t.Fatal("dap session is not ready")
+	}
+	// A dap.Server doesn't support accept-multiclient, but we can use this
+	// hack to test the inner connection logic that is used by a server that does.
+	s.impl.session.config.AcceptMulti = true
+	s.impl.session.debugger = s.debugger
+	s.impl.sessionMu.Unlock()
+	return client
+}
+
+func (s *MultiClientCloseServerMock) stop(t *testing.T) {
+	close(s.forceStop)
+	// If the server doesn't have an active session,
+	// closing it would leak the debbuger with the target because
+	// they are part of dap.Session.
+	// We must take it down manually as if we are in rpccommon::ServerImpl::Stop.
+	if s.debugger.IsRunning() {
+		s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
+	}
+	s.debugger.Detach(true)
+}
+
+func (s *MultiClientCloseServerMock) verifyStopped(t *testing.T) {
+	if state, err := s.debugger.State(true /*nowait*/); err != proc.ErrProcessDetached && !processExited(state, err) {
+		t.Errorf("target leak")
+	}
+	verifyServerStopped(t, s.impl)
 }
 
 // TestAttachRemoteMultiClientDisconnect tests that that remote attach doesn't take down
@@ -6634,20 +6773,9 @@ func TestAttachRemoteMultiClientDisconnect(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			serverStopped := make(chan struct{})
-			server, forceStop := startDAPServer(t, serverStopped)
-			client := daptest.NewClient(server.listener.Addr().String())
+			server := NewMultiClientCloseServerMock(t, "increment")
+			client := server.acceptNewClient(t)
 			defer client.Close()
-			time.Sleep(100 * time.Millisecond) // Give time for connection to be set as dap.Session
-			server.sessionMu.Lock()
-			if server.session == nil {
-				t.Fatal("dap session is not ready")
-			}
-			// DAP server doesn't support accept-multiclient, but we can use this
-			// hack to test the inner connection logic that can be used by a server that does.
-			server.session.config.AcceptMulti = true
-			_, server.session.debugger = launchDebuggerWithTargetHalted(t, "increment")
-			server.sessionMu.Unlock()
 
 			client.InitializeRequest()
 			client.ExpectInitializeResponseAndCapabilities(t)
@@ -6670,13 +6798,16 @@ func TestAttachRemoteMultiClientDisconnect(t *testing.T) {
 			time.Sleep(10 * time.Millisecond) // give time for things to shut down
 
 			if tc.expect == closingClientSessionOnly {
-				// At this point a multi-client server is still running.
-				verifySessionStopped(t, server.session)
-				// Since it is a dap server, it cannot accept another client, so the only
-				// way to take down the server is to force-kill it.
-				close(forceStop)
+				// At this point a multi-client server is still running. but session should be done.
+				verifySessionStopped(t, server.impl.session)
+				// Verify target's running state.
+				if server.debugger.IsRunning() {
+					t.Errorf("\ngot running=true, want false")
+				}
+				server.stop(t)
 			}
-			<-serverStopped
+			<-server.stopped
+			server.verifyStopped(t)
 		})
 	}
 }
@@ -6728,7 +6859,7 @@ func TestBadInitializeRequest(t *testing.T) {
 		// Only one initialize request is allowed, so use a new server
 		// for each test.
 		serverStopped := make(chan struct{})
-		client := startDAPServerWithClient(t, serverStopped)
+		client := startDAPServerWithClient(t, false, serverStopped)
 		defer client.Close()
 
 		client.InitializeRequestWithArgs(args)
@@ -7220,4 +7351,38 @@ func TestFindInstructions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDisassembleCgo(t *testing.T) {
+	// Test that disassembling a program containing cgo code does not create problems.
+	// See issue #3040
+	runTestBuildFlags(t, "cgodisass", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{11},
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 11)
+
+					client.StackTraceRequest(1, 0, 1)
+					st := client.ExpectStackTraceResponse(t)
+					if len(st.Body.StackFrames) < 1 {
+						t.Fatalf("\ngot  %#v\nwant len(stackframes) => 1", st)
+					}
+
+					// Request the single instruction that the program is stopped at.
+					pc := st.Body.StackFrames[0].InstructionPointerReference
+
+					client.DisassembleRequest(pc, -200, 400)
+					client.ExpectDisassembleResponse(t)
+				},
+				disconnect: true,
+			}},
+		)
+	},
+		protest.AllNonOptimized, true)
 }

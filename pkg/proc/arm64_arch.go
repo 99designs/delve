@@ -9,19 +9,30 @@ import (
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/regnum"
+	"github.com/go-delve/delve/pkg/goversion"
 )
 
 var arm64BreakInstruction = []byte{0x0, 0x0, 0x20, 0xd4}
 
+// Windows ARM64 expects a breakpoint to be compiled to the instruction BRK #0xF000.
+// See go.dev/issues/53837.
+var arm64WindowsBreakInstruction = []byte{0x0, 0x0, 0x3e, 0xd4}
+
 // ARM64Arch returns an initialized ARM64
 // struct.
 func ARM64Arch(goos string) *Arch {
+	var brk []byte
+	if goos == "windows" {
+		brk = arm64WindowsBreakInstruction
+	} else {
+		brk = arm64BreakInstruction
+	}
 	return &Arch{
 		Name:                             "arm64",
 		ptrSize:                          8,
 		maxInstructionLength:             4,
-		breakpointInstruction:            arm64BreakInstruction,
-		breakInstrMovesPC:                false,
+		breakpointInstruction:            brk,
+		breakInstrMovesPC:                goos == "windows",
 		derefTLS:                         false,
 		prologues:                        prologuesARM64,
 		fixFrameUnwindContext:            arm64FixFrameUnwindContext,
@@ -35,8 +46,13 @@ func ARM64Arch(goos string) *Arch {
 		usesLR:                           true,
 		PCRegNum:                         regnum.ARM64_PC,
 		SPRegNum:                         regnum.ARM64_SP,
+		ContextRegNum:                    regnum.ARM64_X0 + 26,
+		LRRegNum:                         regnum.ARM64_LR,
 		asmRegisters:                     arm64AsmRegisters,
 		RegisterNameToDwarf:              nameToDwarfFunc(regnum.ARM64NameToDwarf),
+		RegnumToString:                   regnum.ARM64ToName,
+		debugCallMinStackSize:            288,
+		maxRegArgBytes:                   16*8 + 16*8, // 16 int argument registers plus 16 float argument registers
 	}
 }
 
@@ -96,12 +112,7 @@ func arm64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *Binary
 	if a.crosscall2fn != nil && pc >= a.crosscall2fn.Entry && pc < a.crosscall2fn.End {
 		rule := fctxt.CFA
 		if rule.Offset == crosscall2SPOffsetBad {
-			switch bi.GOOS {
-			case "windows":
-				rule.Offset += crosscall2SPOffsetWindows
-			default:
-				rule.Offset += crosscall2SPOffsetNonWindows
-			}
+			rule.Offset += crosscall2SPOffset
 		}
 		fctxt.CFA = rule
 	}
@@ -146,13 +157,20 @@ func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool 
 			return true
 		case "crosscall2":
 			//The offsets get from runtime/cgo/asm_arm64.s:10
+			bpoff := uint64(14)
+			lroff := uint64(15)
+			if producer := it.bi.Producer(); producer != "" && goversion.ProducerAfterOrEqual(producer, 1, 19) {
+				// In Go 1.19 (specifically eee6f9f82) the order registers are saved was changed.
+				bpoff = 22
+				lroff = 23
+			}
 			newsp, _ := readUintRaw(it.mem, uint64(it.regs.SP()+8*24), int64(it.bi.Arch.PtrSize()))
-			newbp, _ := readUintRaw(it.mem, uint64(it.regs.SP()+8*14), int64(it.bi.Arch.PtrSize()))
-			newlr, _ := readUintRaw(it.mem, uint64(it.regs.SP()+8*15), int64(it.bi.Arch.PtrSize()))
+			newbp, _ := readUintRaw(it.mem, uint64(it.regs.SP()+8*bpoff), int64(it.bi.Arch.PtrSize()))
+			newlr, _ := readUintRaw(it.mem, uint64(it.regs.SP()+8*lroff), int64(it.bi.Arch.PtrSize()))
 			if it.regs.Reg(it.regs.BPRegNum) != nil {
 				it.regs.Reg(it.regs.BPRegNum).Uint64Val = uint64(newbp)
 			} else {
-				reg, _ := it.readRegisterAt(it.regs.BPRegNum, it.regs.SP()+8*14)
+				reg, _ := it.readRegisterAt(it.regs.BPRegNum, it.regs.SP()+8*bpoff)
 				it.regs.AddReg(it.regs.BPRegNum, reg)
 			}
 			it.regs.Reg(it.regs.LRRegNum).Uint64Val = uint64(newlr)

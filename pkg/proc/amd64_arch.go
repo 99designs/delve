@@ -40,6 +40,9 @@ func AMD64Arch(goos string) *Arch {
 		ContextRegNum:                    regnum.AMD64_Rdx,
 		asmRegisters:                     amd64AsmRegisters,
 		RegisterNameToDwarf:              nameToDwarfFunc(regnum.AMD64NameToDwarf),
+		RegnumToString:                   regnum.AMD64ToName,
+		debugCallMinStackSize:            256,
+		maxRegArgBytes:                   9*8 + 15*8,
 	}
 }
 
@@ -101,9 +104,9 @@ func amd64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *Binary
 		if rule.Offset == crosscall2SPOffsetBad {
 			switch bi.GOOS {
 			case "windows":
-				rule.Offset += crosscall2SPOffsetWindows
+				rule.Offset += crosscall2SPOffsetWindowsAMD64
 			default:
-				rule.Offset += crosscall2SPOffsetNonWindows
+				rule.Offset += crosscall2SPOffset
 			}
 		}
 		fctxt.CFA = rule

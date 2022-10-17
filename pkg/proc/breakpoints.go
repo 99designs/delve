@@ -47,7 +47,6 @@ type Breakpoint struct {
 
 	Addr         uint64 // Address breakpoint is set for.
 	OriginalData []byte // If software breakpoint, the data we replace with breakpoint instruction.
-	Name         string // User defined name of the breakpoint
 
 	WatchExpr     string
 	WatchType     WatchType
@@ -59,14 +58,7 @@ type Breakpoint struct {
 	Breaklets []*Breaklet
 
 	// Breakpoint information
-	Tracepoint  bool // Tracepoint flag
-	TraceReturn bool
-	Goroutine   bool     // Retrieve goroutine information
-	Stacktrace  int      // Number of stack frames to retrieve
-	Variables   []string // Variables to evaluate
-	LoadArgs    *LoadConfig
-	LoadLocals  *LoadConfig
-	UserData    interface{} // Any additional information about the breakpoint
+	Logical *LogicalBreakpoint
 
 	// ReturnInfo describes how to collect return variables when this
 	// breakpoint is hit as a return breakpoint.
@@ -85,9 +77,6 @@ type Breaklet struct {
 	// Cond: if not nil the breakpoint will be triggered only if evaluating Cond returns true
 	Cond ast.Expr
 
-	HitCount      map[int]uint64 // Number of times a breakpoint has been reached in a certain goroutine
-	TotalHitCount uint64         // Number of times a breakpoint has been reached
-
 	// DeferReturns: when kind == NextDeferBreakpoint this breakpoint
 	// will also check if the caller is runtime.gopanic or if the return
 	// address is in the DeferReturns array.
@@ -98,13 +87,6 @@ type Breaklet struct {
 	// function only triggers on panic or on the defer call to
 	// the function, not when the function is called directly
 	DeferReturns []uint64
-
-	// HitCond: if not nil the breakpoint will be triggered only if the evaluated HitCond returns
-	// true with the TotalHitCount.
-	HitCond *struct {
-		Op  token.Token
-		Val int
-	}
 
 	// checkPanicCall checks that the breakpoint happened while the function was
 	// called by a panic. It is only checked for WatchOutOfScopeBreakpoint Kind.
@@ -148,6 +130,10 @@ const (
 	// StackResizeBreakpoint is a breakpoint used to detect stack resizes to
 	// adjust the watchpoint of stack variables.
 	StackResizeBreakpoint
+
+	// PluginOpenBreakpoint is a breakpoint used to detect that a plugin has
+	// been loaded and we should try to enable suspended breakpoints.
+	PluginOpenBreakpoint
 
 	steppingMask = NextBreakpoint | NextDeferBreakpoint | StepBreakpoint
 )
@@ -206,10 +192,12 @@ func (bp *Breakpoint) VerboseDescr() []string {
 		r = append(r, fmt.Sprintf("HWBreakIndex=%#x watchStackOff=%#x", bp.HWBreakIndex, bp.watchStackOff))
 	}
 
+	lbp := bp.Logical
+
 	for _, breaklet := range bp.Breaklets {
 		switch breaklet.Kind {
 		case UserBreakpoint:
-			r = append(r, fmt.Sprintf("User Cond=%q HitCond=%v", exprToString(breaklet.Cond), breaklet.HitCond))
+			r = append(r, fmt.Sprintf("User Cond=%q HitCond=%v", exprToString(breaklet.Cond), lbp.HitCond))
 		case NextBreakpoint:
 			r = append(r, fmt.Sprintf("Next Cond=%q", exprToString(breaklet.Cond)))
 		case NextDeferBreakpoint:
@@ -220,6 +208,8 @@ func (bp *Breakpoint) VerboseDescr() []string {
 			r = append(r, fmt.Sprintf("WatchOutOfScope Cond=%q checkPanicCall=%v", exprToString(breaklet.Cond), breaklet.checkPanicCall))
 		case StackResizeBreakpoint:
 			r = append(r, fmt.Sprintf("StackResizeBreakpoint Cond=%q", exprToString(breaklet.Cond)))
+		case PluginOpenBreakpoint:
+			r = append(r, "PluginOpenBreakpoint")
 		default:
 			r = append(r, fmt.Sprintf("Unknown %d", breaklet.Kind))
 		}
@@ -280,11 +270,16 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 
 	switch breaklet.Kind {
 	case UserBreakpoint:
-		if g, err := GetG(thread); err == nil {
-			breaklet.HitCount[g.ID]++
+		var goroutineID int64
+		lbp := bpstate.Breakpoint.Logical
+		if lbp != nil {
+			if g, err := GetG(thread); err == nil {
+				goroutineID = g.ID
+				lbp.HitCount[goroutineID]++
+			}
+			lbp.TotalHitCount++
 		}
-		breaklet.TotalHitCount++
-		active = checkHitCond(breaklet)
+		active = checkHitCond(lbp, goroutineID)
 
 	case StepBreakpoint, NextBreakpoint, NextDeferBreakpoint:
 		nextDeferOk := true
@@ -315,7 +310,7 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 			}
 		}
 
-	case StackResizeBreakpoint:
+	case StackResizeBreakpoint, PluginOpenBreakpoint:
 		// no further checks
 
 	default:
@@ -331,26 +326,30 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 }
 
 // checkHitCond evaluates bp's hit condition on thread.
-func checkHitCond(breaklet *Breaklet) bool {
-	if breaklet.HitCond == nil {
+func checkHitCond(lbp *LogicalBreakpoint, goroutineID int64) bool {
+	if lbp == nil || lbp.HitCond == nil {
 		return true
 	}
+	hitCount := int(lbp.TotalHitCount)
+	if lbp.HitCondPerG && goroutineID > 0 {
+		hitCount = int(lbp.HitCount[goroutineID])
+	}
 	// Evaluate the breakpoint condition.
-	switch breaklet.HitCond.Op {
+	switch lbp.HitCond.Op {
 	case token.EQL:
-		return int(breaklet.TotalHitCount) == breaklet.HitCond.Val
+		return hitCount == lbp.HitCond.Val
 	case token.NEQ:
-		return int(breaklet.TotalHitCount) != breaklet.HitCond.Val
+		return hitCount != lbp.HitCond.Val
 	case token.GTR:
-		return int(breaklet.TotalHitCount) > breaklet.HitCond.Val
+		return hitCount > lbp.HitCond.Val
 	case token.LSS:
-		return int(breaklet.TotalHitCount) < breaklet.HitCond.Val
+		return hitCount < lbp.HitCond.Val
 	case token.GEQ:
-		return int(breaklet.TotalHitCount) >= breaklet.HitCond.Val
+		return hitCount >= lbp.HitCond.Val
 	case token.LEQ:
-		return int(breaklet.TotalHitCount) <= breaklet.HitCond.Val
+		return hitCount <= lbp.HitCond.Val
 	case token.REM:
-		return int(breaklet.TotalHitCount)%breaklet.HitCond.Val == 0
+		return hitCount%lbp.HitCond.Val == 0
 	}
 	return false
 }
@@ -468,6 +467,9 @@ func (nbp NoBreakpointError) Error() string {
 type BreakpointMap struct {
 	M map[uint64]*Breakpoint
 
+	// Logical is a map of logical breakpoints.
+	Logical map[int]*LogicalBreakpoint
+
 	// WatchOutOfScope is the list of watchpoints that went out of scope during
 	// the last resume operation
 	WatchOutOfScope []*Breakpoint
@@ -579,8 +581,7 @@ func (t *Target) setEBPFTracepointOnFunc(fn *Function, goidOffset int64) error {
 	//TODO(aarzilli): inlined calls?
 
 	// Finally, set the uprobe on the function.
-	t.proc.SetUProbe(fn.Name, goidOffset, args)
-	return nil
+	return t.proc.SetUProbe(fn.Name, goidOffset, args)
 }
 
 // SetWatchpoint sets a data breakpoint at addr and stores it in the
@@ -643,7 +644,7 @@ func (t *Target) SetWatchpoint(logicalID int, scope *EvalScope, expr string, wty
 
 func (t *Target) setBreakpointInternal(logicalID int, addr uint64, kind BreakpointKind, wtype WatchType, cond ast.Expr) (*Breakpoint, error) {
 	if valid, err := t.Valid(); !valid {
-		recorded, _ := t.Recorded()
+		recorded, _ := t.recman.Recorded()
 		if !recorded {
 			return nil, err
 		}
@@ -651,23 +652,42 @@ func (t *Target) setBreakpointInternal(logicalID int, addr uint64, kind Breakpoi
 	bpmap := t.Breakpoints()
 	newBreaklet := &Breaklet{Kind: kind, Cond: cond}
 	if kind == UserBreakpoint {
-		newBreaklet.HitCount = map[int]uint64{}
 		newBreaklet.LogicalID = logicalID
 	}
+
+	setLogicalBreakpoint := func(bp *Breakpoint) {
+		if kind != UserBreakpoint || bp.Logical != nil {
+			return
+		}
+		if bpmap.Logical == nil {
+			bpmap.Logical = make(map[int]*LogicalBreakpoint)
+		}
+		lbp := bpmap.Logical[logicalID]
+		if lbp == nil {
+			lbp = &LogicalBreakpoint{LogicalID: logicalID}
+			lbp.HitCount = make(map[int64]uint64)
+			lbp.Enabled = true
+			bpmap.Logical[logicalID] = lbp
+		}
+		bp.Logical = lbp
+		breaklet := bp.UserBreaklet()
+		if breaklet != nil && breaklet.Cond == nil {
+			breaklet.Cond = lbp.Cond
+		}
+		lbp.File = bp.File
+		lbp.Line = bp.Line
+		fn := t.BinInfo().PCToFunc(bp.Addr)
+		if fn != nil {
+			lbp.FunctionName = fn.NameWithoutTypeParams()
+		}
+	}
+
 	if bp, ok := bpmap.M[addr]; ok {
 		if !bp.canOverlap(kind) {
 			return bp, BreakpointExistsError{bp.File, bp.Line, bp.Addr}
 		}
-		if kind == UserBreakpoint {
-			bp.Tracepoint = false
-			bp.TraceReturn = false
-			bp.Goroutine = false
-			bp.Stacktrace = 0
-			bp.Variables = nil
-			bp.LoadArgs = nil
-			bp.LoadLocals = nil
-		}
 		bp.Breaklets = append(bp.Breaklets, newBreaklet)
+		setLogicalBreakpoint(bp)
 		return bp, nil
 	}
 
@@ -708,6 +728,7 @@ func (t *Target) setBreakpointInternal(logicalID int, addr uint64, kind Breakpoi
 	}
 
 	newBreakpoint.Breaklets = append(newBreakpoint.Breaklets, newBreaklet)
+	setLogicalBreakpoint(newBreakpoint)
 
 	bpmap.M[addr] = newBreakpoint
 
@@ -728,7 +749,7 @@ func (bp *Breakpoint) canOverlap(kind BreakpointKind) bool {
 // ClearBreakpoint clears the breakpoint at addr.
 func (t *Target) ClearBreakpoint(addr uint64) error {
 	if valid, err := t.Valid(); !valid {
-		recorded, _ := t.Recorded()
+		recorded, _ := t.recman.Recorded()
 		if !recorded {
 			return err
 		}
@@ -741,6 +762,9 @@ func (t *Target) ClearBreakpoint(addr uint64) error {
 	for i := range bp.Breaklets {
 		if bp.Breaklets[i].Kind == UserBreakpoint {
 			bp.Breaklets[i] = nil
+			if bp.WatchExpr == "" {
+				bp.Logical = nil
+			}
 		}
 	}
 
@@ -805,6 +829,9 @@ func (t *Target) finishClearBreakpoint(bp *Breakpoint) (bool, error) {
 	}
 
 	delete(t.Breakpoints().M, bp.Addr)
+	if bp.WatchExpr != "" && bp.Logical != nil {
+		delete(t.Breakpoints().Logical, bp.Logical.LogicalID)
+	}
 	return true, nil
 }
 
@@ -924,4 +951,64 @@ func returnInfoError(descr string, err error, mem MemoryReadWriter) []*Variable 
 	v := newConstant(constant.MakeString(fmt.Sprintf("%s: %v", descr, err.Error())), mem)
 	v.Name = "return value read error"
 	return []*Variable{v}
+}
+
+// LogicalBreakpoint represents a breakpoint set by a user.
+// A logical breakpoint can be associated with zero or many physical
+// breakpoints.
+// Where a physical breakpoint is associated with a specific instruction
+// address a logical breakpoint is associated with a source code location.
+// Therefore a logical breakpoint can be associated with zero or many
+// physical breakpoints.
+// It will have one or more physical breakpoints when source code has been
+// inlined (or in the case of type parametric code).
+// It will have zero physical breakpoints when it represents a deferred
+// breakpoint for code that will be loaded in the future.
+type LogicalBreakpoint struct {
+	LogicalID    int
+	Name         string
+	FunctionName string
+	File         string
+	Line         int
+	Enabled      bool
+
+	Set SetBreakpoint
+
+	Tracepoint  bool // Tracepoint flag
+	TraceReturn bool
+	Goroutine   bool     // Retrieve goroutine information
+	Stacktrace  int      // Number of stack frames to retrieve
+	Variables   []string // Variables to evaluate
+	LoadArgs    *LoadConfig
+	LoadLocals  *LoadConfig
+
+	HitCount      map[int64]uint64 // Number of times a breakpoint has been reached in a certain goroutine
+	TotalHitCount uint64           // Number of times a breakpoint has been reached
+	HitCondPerG   bool             // Use per goroutine hitcount as HitCond operand, instead of total hitcount
+
+	// HitCond: if not nil the breakpoint will be triggered only if the evaluated HitCond returns
+	// true with the TotalHitCount.
+	HitCond *struct {
+		Op  token.Token
+		Val int
+	}
+
+	// Cond: if not nil the breakpoint will be triggered only if evaluating Cond returns true
+	Cond ast.Expr
+
+	UserData interface{} // Any additional information about the breakpoint
+}
+
+// SetBreakpoint describes how a breakpoint should be set.
+type SetBreakpoint struct {
+	FunctionName string
+	File         string
+	Line         int
+	Expr         func(*Target) []uint64
+	PidAddrs     []PidAddr
+}
+
+type PidAddr struct {
+	Pid  int
+	Addr uint64
 }

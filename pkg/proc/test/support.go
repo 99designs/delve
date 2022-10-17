@@ -82,6 +82,13 @@ const (
 	LinkDisableDWARF
 )
 
+// TempFile makes a (good enough) random temporary file name
+func TempFile(name string) string {
+	r := make([]byte, 4)
+	rand.Read(r)
+	return filepath.Join(os.TempDir(), fmt.Sprintf("%s.%s", name, hex.EncodeToString(r)))
+}
+
 // BuildFixture will compile the fixture 'name' using the provided build flags.
 func BuildFixture(name string, flags BuildFlags) Fixture {
 	if !runningWithFixtures {
@@ -93,14 +100,13 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 	}
 
 	if flags&EnableCGOOptimization == 0 {
-		os.Setenv("CGO_CFLAGS", "-O0 -g")
+		if os.Getenv("CI") == "" || os.Getenv("CGO_CFLAGS") == "" {
+			os.Setenv("CGO_CFLAGS", "-O0 -g")
+		}
 	}
 
 	fixturesDir := FindFixturesDir()
 
-	// Make a (good enough) random temporary file name
-	r := make([]byte, 4)
-	rand.Read(r)
 	dir := fixturesDir
 	path := filepath.Join(fixturesDir, name+".go")
 	if name[len(name)-1] == '/' {
@@ -108,7 +114,7 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 		path = ""
 		name = name[:len(name)-1]
 	}
-	tmpfile := filepath.Join(os.TempDir(), fmt.Sprintf("%s.%s", name, hex.EncodeToString(r)))
+	tmpfile := TempFile(name)
 
 	buildFlags := []string{"build"}
 	var ver goversion.GoVersion
@@ -163,6 +169,9 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 
 	cmd := exec.Command("go", buildFlags...)
 	cmd.Dir = dir
+	if os.Getenv("CI") != "" {
+		cmd.Env = os.Environ()
+	}
 
 	// Build the test binary
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -263,20 +272,20 @@ func AllowRecording(t testing.TB) {
 // MustHaveRecordingAllowed skips this test if recording is not allowed
 //
 // Not all the tests can be run with a recording:
-// - some fixtures never terminate independently (loopprog,
-//   testnextnethttp) and can not be recorded
-// - some tests assume they can interact with the target process (for
-//   example TestIssue419, or anything changing the value of a variable),
-//   which we can't do on with a recording
-// - some tests assume that the Pid returned by the process is valid, but
-//   it won't be at replay time
-// - some tests will start the fixture but not never execute a single
-//   instruction, for some reason rr doesn't like this and will print an
-//   error if it happens
-// - many tests will assume that we can return from a runtime.Breakpoint,
-//   with a recording this is not possible because when the fixture ran it
-//   wasn't attached to a debugger and in those circumstances a
-//   runtime.Breakpoint leads directly to a crash
+//   - some fixtures never terminate independently (loopprog,
+//     testnextnethttp) and can not be recorded
+//   - some tests assume they can interact with the target process (for
+//     example TestIssue419, or anything changing the value of a variable),
+//     which we can't do on with a recording
+//   - some tests assume that the Pid returned by the process is valid, but
+//     it won't be at replay time
+//   - some tests will start the fixture but not never execute a single
+//     instruction, for some reason rr doesn't like this and will print an
+//     error if it happens
+//   - many tests will assume that we can return from a runtime.Breakpoint,
+//     with a recording this is not possible because when the fixture ran it
+//     wasn't attached to a debugger and in those circumstances a
+//     runtime.Breakpoint leads directly to a crash
 //
 // Some of the tests using runtime.Breakpoint (anything involving variable
 // evaluation and TestWorkDir) have been adapted to work with a recording.
@@ -325,11 +334,16 @@ func MustSupportFunctionCalls(t *testing.T, testBackend string) {
 		t.Skip("this backend does not support function calls")
 	}
 
-	if runtime.GOOS == "darwin" && os.Getenv("TRAVIS") == "true" {
+	if runtime.GOOS == "darwin" && os.Getenv("TRAVIS") == "true" && runtime.GOARCH == "amd64" {
 		t.Skip("function call injection tests are failing on macOS on Travis-CI (see #1802)")
 	}
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "386" {
+	if runtime.GOARCH == "386" {
 		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
+	}
+	if runtime.GOARCH == "arm64" {
+		if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 19) {
+			t.Skip("this version of Go does not support function calls")
+		}
 	}
 }
 

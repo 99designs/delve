@@ -9,7 +9,7 @@ Set-MpPreference -DisableRealtimeMonitoring $true
 #Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
 
 # Install MinGW.
-choco install -y mingw --version 10.2.0 
+choco install -y mingw
 
 # Install Procdump
 if (-Not(Test-Path "C:\procdump"))
@@ -73,4 +73,16 @@ Write-Host $env:GOPATH
 go version
 go env
 go run _scripts/make.go test
-Exit $LastExitCode
+$x = $LastExitCode
+if ($version -ne "gotip") {
+	Exit $x
+}
+
+# TODO: Remove once we have a windows/arm64 builder.
+# Test windows/arm64 compiles.
+$env:GOARCH = "arm64"
+go run _scripts/make.go build --tags exp.winarm64
+$x = $LastExitCode
+if ($version -ne "gotip") {
+	Exit $x
+}

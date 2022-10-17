@@ -196,7 +196,7 @@ const (
 // G represents a runtime G (goroutine) structure (at least the
 // fields that Delve is interested in).
 type G struct {
-	ID      int    // Goroutine ID
+	ID      int64  // Goroutine ID
 	PC      uint64 // PC of goroutine when it was parked.
 	SP      uint64 // SP of goroutine when it was parked.
 	BP      uint64 // BP of goroutine when it was parked (go >= 1.7).
@@ -312,7 +312,7 @@ func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
 	}
 
 	var (
-		threadg = map[int]*G{}
+		threadg = map[int64]*G{}
 		allg    []*G
 	)
 
@@ -367,7 +367,7 @@ func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
 
 // FindGoroutine returns a G struct representing the goroutine
 // specified by `gid`.
-func FindGoroutine(dbp *Target, gid int) (*G, error) {
+func FindGoroutine(dbp *Target, gid int64) (*G, error) {
 	if selg := dbp.SelectedGoroutine(); (gid == -1) || (selg != nil && selg.ID == gid) || (selg == nil && gid == 0) {
 		// Return the currently selected goroutine in the following circumstances:
 		//
@@ -438,8 +438,12 @@ func getGVariable(thread Thread) (*Variable, error) {
 
 	gaddr, hasgaddr := regs.GAddr()
 	if !hasgaddr {
-		var err error
-		gaddr, err = readUintRaw(thread.ProcessMemory(), regs.TLS()+thread.BinInfo().GStructOffset(), int64(thread.BinInfo().Arch.PtrSize()))
+		bi := thread.BinInfo()
+		offset, err := bi.GStructOffset(thread.ProcessMemory())
+		if err != nil {
+			return nil, err
+		}
+		gaddr, err = readUintRaw(thread.ProcessMemory(), regs.TLS()+offset, int64(bi.Arch.PtrSize()))
 		if err != nil {
 			return nil, err
 		}
@@ -662,7 +666,7 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 	case *godwarf.StringType:
 		v.Kind = reflect.String
 		v.stride = 1
-		v.fieldType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 1, Name: "byte"}, BitSize: 8, BitOffset: 0}}
+		v.fieldType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 1, Name: "byte", ReflectKind: reflect.Uint8}, BitSize: 8, BitOffset: 0}}
 		if v.Addr != 0 {
 			v.Base, v.Len, v.Unreadable = readStringInfo(v.mem, v.bi.Arch, v.Addr)
 		}
@@ -740,11 +744,16 @@ func resolveTypedef(typ godwarf.Type) godwarf.Type {
 	}
 }
 
+var constantMaxInt64 = constant.MakeInt64(1<<63 - 1)
+
 func newConstant(val constant.Value, mem MemoryReadWriter) *Variable {
 	v := &Variable{Value: val, mem: mem, loaded: true}
 	switch val.Kind() {
 	case constant.Int:
 		v.Kind = reflect.Int
+		if constant.Sign(val) >= 0 && constant.Compare(val, token.GTR, constantMaxInt64) {
+			v.Kind = reflect.Uint64
+		}
 	case constant.Float:
 		v.Kind = reflect.Float64
 	case constant.Bool:
@@ -828,7 +837,7 @@ var ErrUnreadableG = errors.New("could not read G struct")
 
 func (v *Variable) parseG() (*G, error) {
 	mem := v.mem
-	gaddr := uint64(v.Addr)
+	gaddr := v.Addr
 	_, deref := v.RealType.(*godwarf.PtrType)
 
 	if deref {
@@ -881,7 +890,17 @@ func (v *Variable) parseG() (*G, error) {
 		return n
 	}
 
-	id := loadInt64Maybe("goid")             // +rtype int64
+	loadUint64Maybe := func(name string) uint64 {
+		vv := v.loadFieldNamed(name)
+		if vv == nil {
+			unreadable = true
+			return 0
+		}
+		n, _ := constant.Uint64Val(vv.Value)
+		return n
+	}
+
+	id := loadUint64Maybe("goid")            // +rtype int64|uint64
 	gopc := loadInt64Maybe("gopc")           // +rtype uintptr
 	startpc := loadInt64Maybe("startpc")     // +rtype uintptr
 	waitSince := loadInt64Maybe("waitsince") // +rtype int64
@@ -891,15 +910,34 @@ func (v *Variable) parseG() (*G, error) {
 	}
 	var stackhi, stacklo uint64
 	if stackVar := v.loadFieldNamed("stack"); /* +rtype stack */ stackVar != nil {
-		if stackhiVar := stackVar.fieldVariable("hi"); /* +rtype uintptr */ stackhiVar != nil {
+		if stackhiVar := stackVar.fieldVariable("hi"); /* +rtype uintptr */ stackhiVar != nil && stackhiVar.Value != nil {
 			stackhi, _ = constant.Uint64Val(stackhiVar.Value)
+		} else {
+			unreadable = true
 		}
-		if stackloVar := stackVar.fieldVariable("lo"); /* +rtype uintptr */ stackloVar != nil {
+		if stackloVar := stackVar.fieldVariable("lo"); /* +rtype uintptr */ stackloVar != nil && stackloVar.Value != nil {
 			stacklo, _ = constant.Uint64Val(stackloVar.Value)
+		} else {
+			unreadable = true
 		}
 	}
 
-	status := loadInt64Maybe("atomicstatus") // +rtype uint32
+	status := uint64(0)
+	if atomicStatus := v.loadFieldNamed("atomicstatus"); /* +rtype uint32|runtime/internal/atomic.Uint32 */ atomicStatus != nil {
+		if constant.Val(atomicStatus.Value) != nil {
+			status, _ = constant.Uint64Val(atomicStatus.Value)
+		} else {
+			atomicStatus := atomicStatus              // +rtype runtime/internal/atomic.Uint32
+			vv := atomicStatus.fieldVariable("value") // +rtype uint32
+			if vv == nil {
+				unreadable = true
+			} else {
+				status, _ = constant.Uint64Val(vv.Value)
+			}
+		}
+	} else {
+		unreadable = true
+	}
 
 	if unreadable {
 		return nil, ErrUnreadableG
@@ -910,7 +948,7 @@ func (v *Variable) parseG() (*G, error) {
 	v.Name = "runtime.curg"
 
 	g := &G{
-		ID:         int(id),
+		ID:         int64(id),
 		GoPC:       uint64(gopc),
 		StartPC:    uint64(startpc),
 		PC:         uint64(pc),
@@ -1627,7 +1665,7 @@ func (v *Variable) readComplex(size int64) {
 		return
 	}
 
-	ftyp := &godwarf.FloatType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: fs, Name: fmt.Sprintf("float%d", fs)}, BitSize: fs * 8, BitOffset: 0}}
+	ftyp := fakeBasicType("float", int(fs*8))
 
 	realvar := v.newVariable("real", v.Addr, ftyp, v.mem)
 	imagvar := v.newVariable("imaginary", v.Addr+uint64(fs), ftyp, v.mem)
@@ -2278,37 +2316,47 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 		switch newtyp {
 		case "int8":
 			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.mem)
+			child.Kind = reflect.Int8
 			n = 1
 		case "int16":
 			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.mem)
+			child.Kind = reflect.Int16
 			n = 2
 		case "int32":
 			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.mem)
+			child.Kind = reflect.Int32
 			n = 4
 		case "int64":
 			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.mem)
+			child.Kind = reflect.Int64
 			n = 8
 		case "uint8":
 			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.mem)
+			child.Kind = reflect.Uint8
 			n = 1
 		case "uint16":
 			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.mem)
+			child.Kind = reflect.Uint16
 			n = 2
 		case "uint32":
 			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.mem)
+			child.Kind = reflect.Uint32
 			n = 4
 		case "uint64":
 			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.mem)
+			child.Kind = reflect.Uint64
 			n = 8
 		case "float32":
 			a := binary.LittleEndian.Uint32(v.reg.Bytes[i:])
 			x := *(*float32)(unsafe.Pointer(&a))
 			child = newConstant(constant.MakeFloat64(float64(x)), v.mem)
+			child.Kind = reflect.Float32
 			n = 4
 		case "float64":
 			a := binary.LittleEndian.Uint64(v.reg.Bytes[i:])
 			x := *(*float64)(unsafe.Pointer(&a))
 			child = newConstant(constant.MakeFloat64(x), v.mem)
+			child.Kind = reflect.Float64
 			n = 8
 		default:
 			if n == 0 {

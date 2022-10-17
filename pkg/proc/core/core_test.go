@@ -256,6 +256,12 @@ func TestCore(t *testing.T) {
 		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
 	}
 	p := withCoreFile(t, "panic", "")
+	grp := proc.NewGroup(p)
+
+	recorded, _ := grp.Recorded()
+	if !recorded {
+		t.Fatalf("expecting recorded to be true")
+	}
 
 	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
 	if err != nil || len(gs) == 0 {
@@ -440,8 +446,8 @@ mainSearch:
 }
 
 func TestMinidump(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("minidumps can only be produced on windows")
+	if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
+		t.Skip("minidumps can only be produced on windows/amd64")
 	}
 	var buildFlags test.BuildFlags
 	if buildMode == "pie" {

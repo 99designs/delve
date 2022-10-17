@@ -180,11 +180,12 @@ Set breakpoint condition.
 
 	condition <breakpoint name or id> <boolean expression>.
 	condition -hitcount <breakpoint name or id> <operator> <argument>.
+	condition -per-g-hitcount <breakpoint name or id> <operator> <argument>.
 	condition -clear <breakpoint name or id>.
 
 Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
 
-See Documentation/cli/expr.md for a description of supported expressions.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
 
 With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
 
@@ -195,6 +196,8 @@ With the -hitcount option a condition on the breakpoint hit count can be set, th
 	condition -hitcount bp == n
 	condition -hitcount bp != n
 	condition -hitcount bp % n
+
+The -per-g-hitcount option works like -hitcount, but use per goroutine hitcount to compare with n.
 
 With the -clear option a condtion on the breakpoint can removed.
 	
@@ -315,7 +318,7 @@ Examine memory:
 	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] <address>
 	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] -x <expression>
 
-Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal), addr(address).
+Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal).
 Length is the number of bytes (default 1) and must be less than or equal to 1000.
 Address is the memory location of the target to examine. Please note '-len' is deprecated by '-count and -size'.
 Expression can be an integer expression or pointer value of the memory location to examine.
@@ -372,7 +375,7 @@ Aliases: gr
 ## goroutines
 List program goroutines.
 
-	goroutines [-u|-r|-g|-s] [-t [depth]] [-l] [-with loc expr] [-without loc expr] [-group argument]
+	goroutines [-u|-r|-g|-s] [-t [depth]] [-l] [-with loc expr] [-without loc expr] [-group argument] [-exec command]
 
 Print out info for every goroutine. The flag controls what information is shown along with each goroutine:
 
@@ -427,6 +430,12 @@ Groups goroutines by the given location, running status or user classification, 
 	goroutines -group label key
 
 Groups goroutines by the value of the label with the specified key.
+
+EXEC
+
+	goroutines -exec <command>
+
+Runs the command on every goroutine.
 
 
 Aliases: grs
@@ -502,7 +511,7 @@ Evaluate an expression.
 
 	[goroutine <n>] [frame <m>] print [%format] <expression>
 
-See Documentation/cli/expr.md for a description of supported expressions.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
 
 The optional format argument is a format specifier, like the ones used by the fmt package. For example "print %x v" will print v as an hexadecimal number.
 
@@ -517,7 +526,7 @@ Print contents of CPU registers.
 
 	regs [-a]
 
-Argument -a shows more registers. Individual registers can also be displayed by 'print' and 'display'. See Documentation/cli/expr.md.
+Argument -a shows more registers. Individual registers can also be displayed by 'print' and 'display'. See [Documentation/cli/expr.md.](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md.)
 
 
 ## restart
@@ -547,7 +556,7 @@ Aliases: r
 
 ## rev
 Reverses the execution of the target program for the command specified.
-Currently, only the rev step-instruction command is supported.
+Currently, rev next, step, step-instruction and stepout commands are supported.
 
 
 ## rewind
@@ -560,7 +569,7 @@ Changes the value of a variable.
 
 	[goroutine <n>] [frame <m>] set <variable> = <value>
 
-See Documentation/cli/expr.md for a description of supported expressions. Only numerical variables and pointers can be changed.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions. Only numerical variables and pointers can be changed.
 
 
 ## source

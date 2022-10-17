@@ -50,8 +50,12 @@
 // 	it must have type T).
 //
 //
-// Anywhere a type is required anytype can be used to specify that we don't
-// care about its type.
+// Anywhere a type is required the following expressions can be used:
+//
+//  - any builtin type
+//  - a type defined in the runtime package, without the 'runtime.' prefix
+//  - anytype to match all possible types
+//  - an expression of the form T1|T2 where both T1 and T2 can be arbitrary type expressions
 
 package main
 
@@ -379,7 +383,7 @@ func processProcVariableUses(decl ast.Node, tinfo *types.Info, procVarIdent *ast
 		}
 		var methodName string
 		if isParseG {
-			if xident, _ := fncall.Fun.(*ast.Ident); xident != nil && xident.Name == "loadInt64Maybe" {
+			if xident, _ := fncall.Fun.(*ast.Ident); xident != nil && (xident.Name == "loadInt64Maybe" || xident.Name == "loadUint64Maybe") {
 				methodName = "loadInt64Maybe"
 			}
 		}
@@ -508,20 +512,44 @@ func report() {
 	}
 }
 
-// check parses the runtime package and checks that all the rules retrieved
-// from the 'proc' package pass.
-func check() {
-	pkgs2, err := packages.Load(&packages.Config{Mode: packages.LoadSyntax, Fset: fset}, "runtime")
+func lookupPackage(pkgmap map[string]*packages.Package, name string) *packages.Package {
+	if pkgmap[name] != nil {
+		return pkgmap[name]
+	}
+
+	pkgs, err := packages.Load(&packages.Config{Mode: packages.LoadSyntax, Fset: fset}, name)
 	if err != nil {
 		log.Fatalf("could not load runtime package: %v", err)
 	}
+	packages.Visit(pkgs, func(pkg *packages.Package) bool {
+		if pkgmap[pkg.ID] == nil {
+			pkgmap[pkg.ID] = pkg
+		}
+		return true
+	}, nil)
 
+	return pkgmap[name]
+}
+
+func lookupTypeDef(pkgmap map[string]*packages.Package, typ string) types.Object {
+	dot := strings.Index(typ, ".")
+	if dot < 0 {
+		return lookupPackage(pkgmap, "runtime").Types.Scope().Lookup(typ)
+	}
+
+	return lookupPackage(pkgmap, typ[:dot]).Types.Scope().Lookup(typ[dot+1:])
+}
+
+// check parses the runtime package and checks that all the rules retrieved
+// from the 'proc' package pass.
+func check() {
+	pkgmap := map[string]*packages.Package{}
 	allok := true
 
 	for _, rule := range checkVarTypeRules {
 		//TODO: implement
 		pos := fset.Position(rule.pos)
-		def := pkgs2[0].Types.Scope().Lookup(rule.V)
+		def := lookupPackage(pkgmap, "runtime").Types.Scope().Lookup(rule.V)
 		if def == nil {
 			fmt.Fprintf(os.Stderr, "%s:%d: could not find variable %s\n", pos.Filename, pos.Line, rule.V)
 			allok = false
@@ -543,7 +571,7 @@ func check() {
 		rules := checkFieldTypeRules[S]
 		pos := fset.Position(rules[0].pos)
 
-		def := pkgs2[0].Types.Scope().Lookup(S)
+		def := lookupTypeDef(pkgmap, S)
 		if def == nil {
 			fmt.Fprintf(os.Stderr, "%s:%d: could not find struct %s\n", pos.Filename, pos.Line, S)
 			allok = false
@@ -590,7 +618,7 @@ func check() {
 	for _, C := range Cs {
 		rules := checkConstValRules[C]
 		pos := fset.Position(rules[0].pos)
-		def := pkgs2[0].Types.Scope().Lookup(C)
+		def := lookupPackage(pkgmap, "runtime").Types.Scope().Lookup(C)
 		if def == nil {
 			fmt.Fprintf(os.Stderr, "%s:%d: could not find constant %s\n", pos.Filename, pos.Line, C)
 			allok = false
@@ -629,6 +657,14 @@ func fieldTypeByName(typ *types.Struct, name string) types.Type {
 func matchType(typ types.Type, T string) bool {
 	if T == "anytype" {
 		return true
+	}
+	if strings.Index(T, "|") > 0 {
+		for _, t1 := range strings.Split(T, "|") {
+			if typeStr(typ) == t1 {
+				return true
+			}
+		}
+		return false
 	}
 	return typeStr(typ) == T
 }

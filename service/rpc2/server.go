@@ -176,7 +176,7 @@ func (s *RPCServer) GetBreakpoint(arg GetBreakpointIn, out *GetBreakpointOut) er
 }
 
 type StacktraceIn struct {
-	Id     int
+	Id     int64
 	Depth  int
 	Full   bool
 	Defers bool // read deferred functions (equivalent to passing StacktraceReadDefers in Opts)
@@ -210,7 +210,7 @@ func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 }
 
 type AncestorsIn struct {
-	GoroutineID  int
+	GoroutineID  int64
 	NumAncestors int
 	Depth        int
 }
@@ -242,6 +242,10 @@ func (s *RPCServer) ListBreakpoints(arg ListBreakpointsIn, out *ListBreakpointsO
 
 type CreateBreakpointIn struct {
 	Breakpoint api.Breakpoint
+
+	LocExpr             string
+	SubstitutePathRules [][2]string
+	Suspended           bool
 }
 
 type CreateBreakpointOut struct {
@@ -256,7 +260,7 @@ func (s *RPCServer) CreateBreakpoint(arg CreateBreakpointIn, out *CreateBreakpoi
 	if err := api.ValidBreakpointName(arg.Breakpoint.Name); err != nil {
 		return err
 	}
-	createdbp, err := s.debugger.CreateBreakpoint(&arg.Breakpoint)
+	createdbp, err := s.debugger.CreateBreakpoint(&arg.Breakpoint, arg.LocExpr, arg.SubstitutePathRules, arg.Suspended)
 	if err != nil {
 		return err
 	}
@@ -387,7 +391,7 @@ func (s *RPCServer) ListThreads(arg ListThreadsIn, out *ListThreadsOut) (err err
 	}
 	s.debugger.LockTarget()
 	defer s.debugger.UnlockTarget()
-	out.Threads = api.ConvertThreads(threads)
+	out.Threads = api.ConvertThreads(threads, s.debugger.ConvertThreadBreakpoint)
 	return nil
 }
 
@@ -410,7 +414,7 @@ func (s *RPCServer) GetThread(arg GetThreadIn, out *GetThreadOut) error {
 	}
 	s.debugger.LockTarget()
 	defer s.debugger.UnlockTarget()
-	out.Thread = api.ConvertThread(t)
+	out.Thread = api.ConvertThread(t, s.debugger.ConvertThreadBreakpoint(t))
 	return nil
 }
 
@@ -632,15 +636,21 @@ type ListGoroutinesOut struct {
 // If arg.Filters are specified the list of returned goroutines is filtered
 // applying the specified filters.
 // For example:
-//    ListGoroutinesFilter{ Kind: ListGoroutinesFilterUserLoc, Negated: false, Arg: "afile.go" }
+//
+//	ListGoroutinesFilter{ Kind: ListGoroutinesFilterUserLoc, Negated: false, Arg: "afile.go" }
+//
 // will only return goroutines whose UserLoc contains "afile.go" as a substring.
 // More specifically a goroutine matches a location filter if the specified
 // location, formatted like this:
-//    filename:lineno in function
+//
+//	filename:lineno in function
+//
 // contains Arg[0] as a substring.
 //
 // Filters can also be applied to goroutine labels:
-//    ListGoroutineFilter{ Kind: ListGoroutinesFilterLabel, Negated: false, Arg: "key=value" }
+//
+//	ListGoroutineFilter{ Kind: ListGoroutinesFilterLabel, Negated: false, Arg: "key=value" }
+//
 // this filter will only return goroutines that have a key=value label.
 //
 // If arg.GroupBy is not GoroutineFieldNone then the goroutines will
@@ -700,15 +710,15 @@ type FindLocationOut struct {
 
 // FindLocation returns concrete location information described by a location expression.
 //
-//  loc ::= <filename>:<line> | <function>[:<line>] | /<regex>/ | (+|-)<offset> | <line> | *<address>
-//  * <filename> can be the full path of a file or just a suffix
-//  * <function> ::= <package>.<receiver type>.<name> | <package>.(*<receiver type>).<name> | <receiver type>.<name> | <package>.<name> | (*<receiver type>).<name> | <name>
-//  * <function> must be unambiguous
-//  * /<regex>/ will return a location for each function matched by regex
-//  * +<offset> returns a location for the line that is <offset> lines after the current line
-//  * -<offset> returns a location for the line that is <offset> lines before the current line
-//  * <line> returns a location for a line in the current file
-//  * *<address> returns the location corresponding to the specified address
+//	loc ::= <filename>:<line> | <function>[:<line>] | /<regex>/ | (+|-)<offset> | <line> | *<address>
+//	* <filename> can be the full path of a file or just a suffix
+//	* <function> ::= <package>.<receiver type>.<name> | <package>.(*<receiver type>).<name> | <receiver type>.<name> | <package>.<name> | (*<receiver type>).<name> | <name>
+//	  <function> must be unambiguous
+//	* /<regex>/ will return a location for each function matched by regex
+//	* +<offset> returns a location for the line that is <offset> lines after the current line
+//	* -<offset> returns a location for the line that is <offset> lines before the current line
+//	* <line> returns a location for a line in the current file
+//	* *<address> returns the location corresponding to the specified address
 //
 // NOTE: this function does not actually set breakpoints.
 func (c *RPCServer) FindLocation(arg FindLocationIn, out *FindLocationOut) error {

@@ -359,9 +359,11 @@ func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs 
 		// store the MOV instruction.
 		// If the stub doesn't support memory allocation reloadRegisters will
 		// overwrite some existing memory to store the MOV.
-		if addr, err := p.conn.allocMemory(256); err == nil {
-			if _, err := p.conn.writeMemory(addr, p.loadGInstr()); err == nil {
-				p.loadGInstrAddr = addr
+		if ginstr, err := p.loadGInstr(); err == nil {
+			if addr, err := p.conn.allocMemory(256); err == nil {
+				if _, err := p.conn.writeMemory(addr, ginstr); err == nil {
+					p.loadGInstrAddr = addr
+				}
 			}
 		}
 	}
@@ -709,7 +711,9 @@ func (p *gdbProcess) initialize(path string, debugInfoDirs []string, stopReason 
 		DebugInfoDirs:       debugInfoDirs,
 		DisableAsyncPreempt: runtime.GOOS == "darwin",
 		StopReason:          stopReason,
-		CanDump:             runtime.GOOS == "darwin"})
+		CanDump:             runtime.GOOS == "darwin",
+		ContinueOnce:        continueOnce,
+	})
 	if err != nil {
 		p.Detach(true)
 		return nil, err
@@ -799,9 +803,11 @@ const (
 	debugServerTargetExcBreakpoint     = 0x96
 )
 
-// ContinueOnce will continue execution of the process until
-// a breakpoint is hit or signal is received.
-func (p *gdbProcess) ContinueOnce(cctx *proc.ContinueOnceContext) (proc.Thread, proc.StopReason, error) {
+func continueOnce(procs []proc.ProcessInternal, cctx *proc.ContinueOnceContext) (proc.Thread, proc.StopReason, error) {
+	if len(procs) != 1 {
+		panic("not implemented")
+	}
+	p := procs[0].(*gdbProcess)
 	if p.exited {
 		return nil, proc.StopExited, proc.ErrProcessExited{Pid: p.conn.pid}
 	}
@@ -849,6 +855,9 @@ continueLoop:
 
 		// For stubs that support qThreadStopInfo updateThreadList will
 		// find out the reason why each thread stopped.
+		// NOTE: because debugserver will sometimes send two stop packets after a
+		// continue it is important that this is the very first thing we do after
+		// resume(). See comment in threadStopInfo for an explanation.
 		p.updateThreadList(&tu)
 
 		trapthread = p.findThreadByStrID(threadID)
@@ -1546,7 +1555,7 @@ func (t *gdbThread) Blocked() bool {
 // loadGInstr returns the correct MOV instruction for the current
 // OS/architecture that can be executed to load the address of G from an
 // inferior's thread.
-func (p *gdbProcess) loadGInstr() []byte {
+func (p *gdbProcess) loadGInstr() ([]byte, error) {
 	var op []byte
 	switch p.bi.GOOS {
 	case "windows", "darwin", "freebsd":
@@ -1558,10 +1567,14 @@ func (p *gdbProcess) loadGInstr() []byte {
 	default:
 		panic("unsupported operating system attempting to find Goroutine on Thread")
 	}
+	offset, err := p.bi.GStructOffset(p.Memory())
+	if err != nil {
+		return nil, err
+	}
 	buf := &bytes.Buffer{}
 	buf.Write(op)
-	binary.Write(buf, binary.LittleEndian, uint32(p.bi.GStructOffset()))
-	return buf.Bytes()
+	binary.Write(buf, binary.LittleEndian, uint32(offset))
+	return buf.Bytes(), nil
 }
 
 func (p *gdbProcess) MemoryMap() ([]proc.MemoryMapEntry, error) {
@@ -1720,7 +1733,10 @@ func (t *gdbThread) readSomeRegisters(regNames ...string) error {
 // the MOV instruction used to load current G, executes this single
 // instruction and then puts everything back the way it was.
 func (t *gdbThread) reloadGAtPC() error {
-	movinstr := t.p.loadGInstr()
+	movinstr, err := t.p.loadGInstr()
+	if err != nil {
+		return err
+	}
 
 	if t.Blocked() {
 		t.regs.tls = 0
@@ -1753,7 +1769,7 @@ func (t *gdbThread) reloadGAtPC() error {
 	}
 
 	savedcode := make([]byte, len(movinstr))
-	_, err := t.p.ReadMemory(savedcode, pc)
+	_, err = t.p.ReadMemory(savedcode, pc)
 	if err != nil {
 		return err
 	}
@@ -1915,6 +1931,10 @@ func (regs *gdbRegisters) GAddr() (uint64, bool) {
 	return regs.gaddr, regs.hasgaddr
 }
 
+func (regs *gdbRegisters) LR() uint64 {
+	return binary.LittleEndian.Uint64(regs.regs["lr"].value)
+}
+
 func (regs *gdbRegisters) byName(name string) uint64 {
 	reg, ok := regs.regs[name]
 	if !ok {
@@ -1951,27 +1971,64 @@ func (t *gdbThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
 			gdbreg, ok = t.regs.regs["z"+regName[1:]]
 		}
 	}
+	if !ok && t.p.bi.Arch.Name == "arm64" && regName == "x30" {
+		gdbreg, ok = t.regs.regs["lr"]
+	}
+	if !ok && regName == "rflags" {
+		// rr has eflags instead of rflags
+		regName = "eflags"
+		gdbreg, ok = t.regs.regs[regName]
+		if ok {
+			reg.FillBytes()
+			reg.Bytes = reg.Bytes[:4]
+		}
+	}
 	if !ok {
 		return fmt.Errorf("could not set register %s: not found", regName)
 	}
 	reg.FillBytes()
-	if len(reg.Bytes) != len(gdbreg.value) {
-		return fmt.Errorf("could not set register %s: wrong size, expected %d got %d", regName, len(gdbreg.value), len(reg.Bytes))
+
+	wrongSizeErr := func(n int) error {
+		return fmt.Errorf("could not set register %s: wrong size, expected %d got %d", regName, n, len(reg.Bytes))
 	}
-	copy(gdbreg.value, reg.Bytes)
-	err := t.p.conn.writeRegister(t.strID, gdbreg.regnum, gdbreg.value)
-	if err != nil {
-		return err
-	}
-	if t.p.conn.workaroundReg != nil && len(gdbreg.value) > 16 {
-		// This is a workaround for a bug in debugserver where register writes (P
-		// packet) on AVX-2 and AVX-512 registers are ignored unless they are
-		// followed by a write to an AVX register.
-		// See:
-		//  Issue #2767
-		//  https://bugs.llvm.org/show_bug.cgi?id=52362
-		reg := t.regs.gdbRegisterNew(t.p.conn.workaroundReg)
-		return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
+
+	if len(reg.Bytes) == len(gdbreg.value) {
+		copy(gdbreg.value, reg.Bytes)
+		err := t.p.conn.writeRegister(t.strID, gdbreg.regnum, gdbreg.value)
+		if err != nil {
+			return err
+		}
+		if t.p.conn.workaroundReg != nil && len(gdbreg.value) > 16 {
+			// This is a workaround for a bug in debugserver where register writes (P
+			// packet) on AVX-2 and AVX-512 registers are ignored unless they are
+			// followed by a write to an AVX register.
+			// See:
+			//  Issue #2767
+			//  https://bugs.llvm.org/show_bug.cgi?id=52362
+			reg := t.regs.gdbRegisterNew(t.p.conn.workaroundReg)
+			return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
+		}
+	} else if len(reg.Bytes) == 2*len(gdbreg.value) && strings.HasPrefix(regName, "xmm") {
+		// rr uses xmmN for the low part of the register and ymmNh for the high part
+		gdbregh, ok := t.regs.regs["y"+regName[1:]+"h"]
+		if !ok {
+			return wrongSizeErr(len(gdbreg.value))
+		}
+		if len(reg.Bytes) != len(gdbreg.value)+len(gdbregh.value) {
+			return wrongSizeErr(len(gdbreg.value) + len(gdbregh.value))
+		}
+		copy(gdbreg.value, reg.Bytes[:len(gdbreg.value)])
+		copy(gdbregh.value, reg.Bytes[len(gdbreg.value):])
+		err := t.p.conn.writeRegister(t.strID, gdbreg.regnum, gdbreg.value)
+		if err != nil {
+			return err
+		}
+		err = t.p.conn.writeRegister(t.strID, gdbregh.regnum, gdbregh.value)
+		if err != nil {
+			return err
+		}
+	} else {
+		return wrongSizeErr(len(gdbreg.value))
 	}
 	return nil
 }

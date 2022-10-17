@@ -219,10 +219,8 @@ type launchAttachArgs struct {
 	// responses.
 	HideSystemGoroutines bool `cfgName:"hideSystemGoroutines"`
 	// substitutePathClientToServer indicates rules for converting file paths between client and debugger.
-	// These must be directory paths.
 	substitutePathClientToServer [][2]string `cfgName:"substitutePath"`
 	// substitutePathServerToClient indicates rules for converting file paths between debugger and client.
-	// These must be directory paths.
 	substitutePathServerToClient [][2]string
 }
 
@@ -393,7 +391,7 @@ func (s *Session) Close() {
 	defer s.mu.Unlock()
 
 	if s.debugger != nil {
-		killProcess := s.config.Debugger.AttachPid == 0
+		killProcess := s.debugger.AttachPid() == 0
 		s.stopDebugSession(killProcess)
 	} else if s.noDebugProcess != nil {
 		s.stopNoDebugProcess()
@@ -1165,7 +1163,7 @@ func (s *Session) onDisconnectRequest(request *dap.DisconnectRequest) {
 		// In case of attach, we leave the program
 		// running by default, which can be
 		// overridden by an explicit request to terminate.
-		killProcess := s.config.Debugger.AttachPid == 0 || request.Arguments.TerminateDebuggee
+		killProcess := s.debugger.AttachPid() == 0 || request.Arguments.TerminateDebuggee
 		err = s.stopDebugSession(killProcess)
 	} else if s.noDebugProcess != nil {
 		s.stopNoDebugProcess()
@@ -1226,7 +1224,7 @@ func (s *Session) stopDebugSession(killProcess bool) error {
 	} else if killProcess {
 		s.logToConsole("Detaching and terminating target process")
 	} else {
-		s.logToConsole("Detaching without terminating target processs")
+		s.logToConsole("Detaching without terminating target process")
 	}
 	err = s.debugger.Detach(killProcess)
 	if err != nil {
@@ -1383,7 +1381,7 @@ func (s *Session) setBreakpoints(prefix string, totalBps int, metadataFunc func(
 				err = setLogMessage(bp, want.logMessage)
 				if err == nil {
 					// Create new breakpoints.
-					got, err = s.debugger.CreateBreakpoint(bp)
+					got, err = s.debugger.CreateBreakpoint(bp, "", nil, false)
 				}
 			}
 		}
@@ -1558,7 +1556,7 @@ func (s *Session) onConfigurationDoneRequest(request *dap.ConfigurationDoneReque
 		}
 		s.send(e)
 	}
-	s.debugger.Target().KeepSteppingBreakpoints = proc.HaltKeepsSteppingBreakpoints | proc.TracepointKeepsSteppingBreakpoints
+	s.debugger.TargetGroup().KeepSteppingBreakpoints = proc.HaltKeepsSteppingBreakpoints | proc.TracepointKeepsSteppingBreakpoints
 
 	s.logToConsole("Type 'dlv help' for list of commands.")
 	s.send(&dap.ConfigurationDoneResponse{Response: *newResponse(request.Request)})
@@ -1610,7 +1608,7 @@ func (s *Session) onThreadsRequest(request *dap.ThreadsRequest) {
 		gs, next, err = s.debugger.Goroutines(0, maxGoroutines)
 		if err == nil {
 			// Parse the goroutine arguments.
-			filters, _, _, _, _, _, parseErr := api.ParseGoroutineArgs(s.args.GoroutineFilters)
+			filters, _, _, _, _, _, _, parseErr := api.ParseGoroutineArgs(s.args.GoroutineFilters)
 			if parseErr != nil {
 				s.logToConsole(parseErr.Error())
 			}
@@ -1691,7 +1689,7 @@ func (s *Session) onThreadsRequest(request *dap.ThreadsRequest) {
 			// so no need to include them here.
 			loc := g.UserCurrent()
 			threads[i].Name = fmt.Sprintf("%s[Go %d] %s%s", selected, g.ID, fnName(&loc), thread)
-			threads[i].Id = g.ID
+			threads[i].Id = int(g.ID)
 		}
 	}
 
@@ -1705,10 +1703,11 @@ func (s *Session) onThreadsRequest(request *dap.ThreadsRequest) {
 // onAttachRequest handles 'attach' request.
 // This is a mandatory request to support.
 // Attach debug sessions support the following modes:
-// -- [DEFAULT] "local" -- attaches debugger to a local running process
-//      Required args: processID
-// -- "remote" - attaches client to a debugger already attached to a process
-//      Required args: none (host/port are used externally to connect)
+//
+//   - [DEFAULT] "local" -- attaches debugger to a local running process.
+//     Required args: processID
+//   - "remote" -- attaches client to a debugger already attached to a process.
+//     Required args: none (host/port are used externally to connect)
 func (s *Session) onAttachRequest(request *dap.AttachRequest) {
 	var args AttachConfig = defaultAttachConfig // narrow copy for initializing non-zero default values
 	if err := unmarshalLaunchAttachArgs(request.Arguments, &args); err != nil {
@@ -1770,9 +1769,15 @@ func (s *Session) onAttachRequest(request *dap.AttachRequest) {
 		if s.config.Debugger.Backend == "rr" {
 			s.send(&dap.CapabilitiesEvent{Event: *newEvent("capabilities"), Body: dap.CapabilitiesEventBody{Capabilities: dap.Capabilities{SupportsStepBack: true}}})
 		}
-		// Give the user an option to terminate this server when client disconnects (default is to leave it)
-		s.send(&dap.CapabilitiesEvent{Event: *newEvent("capabilities"), Body: dap.CapabilitiesEventBody{Capabilities: dap.Capabilities{SupportTerminateDebuggee: true}}})
-		// TODO(polina); also use SupportSuspendDebuggee when available
+		// Customize termination options for debugger and debuggee
+		if s.config.AcceptMulti {
+			// User can stop debugger with process or leave it running
+			s.send(&dap.CapabilitiesEvent{Event: *newEvent("capabilities"), Body: dap.CapabilitiesEventBody{Capabilities: dap.Capabilities{SupportTerminateDebuggee: true}}})
+			// TODO(polina): support SupportSuspendDebuggee when available
+		} else if s.config.Debugger.AttachPid > 0 {
+			// User can stop debugger with process or leave the processs running
+			s.send(&dap.CapabilitiesEvent{Event: *newEvent("capabilities"), Body: dap.CapabilitiesEventBody{Capabilities: dap.Capabilities{SupportTerminateDebuggee: true}}})
+		} // else program was launched and the only option will be to stop both
 	default:
 		s.sendShowUserErrorResponse(request.Request, FailedToAttach, "Failed to attach",
 			fmt.Sprintf("invalid debug configuration - unsupported 'mode' attribute %q", args.Mode))
@@ -1825,7 +1830,7 @@ func (s *Session) sendStepResponse(threadId int, message dap.Message) {
 	s.send(message)
 }
 
-func stoppedGoroutineID(state *api.DebuggerState) (id int) {
+func stoppedGoroutineID(state *api.DebuggerState) (id int64) {
 	if state.SelectedGoroutine != nil {
 		id = state.SelectedGoroutine.ID
 	} else if state.CurrentThread != nil {
@@ -1836,7 +1841,7 @@ func stoppedGoroutineID(state *api.DebuggerState) (id int) {
 
 // stoppedOnBreakpointGoroutineID gets the goroutine id of the first goroutine
 // that is stopped on a real breakpoint, starting with the selected goroutine.
-func (s *Session) stoppedOnBreakpointGoroutineID(state *api.DebuggerState) (int, *api.Breakpoint) {
+func (s *Session) stoppedOnBreakpointGoroutineID(state *api.DebuggerState) (int64, *api.Breakpoint) {
 	// Use the first goroutine that is stopped on a breakpoint.
 	gs := s.stoppedGs(state)
 	if len(gs) == 0 {
@@ -1851,10 +1856,12 @@ func (s *Session) stoppedOnBreakpointGoroutineID(state *api.DebuggerState) (int,
 		return goid, nil
 	}
 	bp := g.Thread.Breakpoint()
-	if bp == nil || bp.Breakpoint == nil {
+	if bp == nil || bp.Breakpoint == nil || bp.Breakpoint.Logical == nil {
 		return goid, nil
 	}
-	return goid, api.ConvertBreakpoint(bp.Breakpoint)
+	abp := api.ConvertLogicalBreakpoint(bp.Breakpoint.Logical)
+	api.ConvertPhysicalBreakpoints(abp, []int{0}, []*proc.Breakpoint{bp.Breakpoint})
+	return goid, abp
 }
 
 // stepUntilStopAndNotify is a wrapper around runUntilStopAndNotify that
@@ -1864,7 +1871,7 @@ func (s *Session) stoppedOnBreakpointGoroutineID(state *api.DebuggerState) (int,
 // due to an error, so the server is ready to receive new requests.
 func (s *Session) stepUntilStopAndNotify(command string, threadId int, granularity dap.SteppingGranularity, allowNextStateChange chan struct{}) {
 	defer closeIfOpen(allowNextStateChange)
-	_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.SwitchGoroutine, GoroutineID: threadId}, nil)
+	_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.SwitchGoroutine, GoroutineID: int64(threadId)}, nil)
 	if err != nil {
 		s.config.log.Errorf("Error switching goroutines while stepping: %v", err)
 		// If we encounter an error, we will have to send a stopped event
@@ -1874,7 +1881,7 @@ func (s *Session) stepUntilStopAndNotify(command string, threadId int, granulari
 		if state, err := s.debugger.State(false); err != nil {
 			s.config.log.Errorf("Error retrieving state: %e", err)
 		} else {
-			stopped.Body.ThreadId = stoppedGoroutineID(state)
+			stopped.Body.ThreadId = int(stoppedGoroutineID(state))
 		}
 		stopped.Body.Reason = "error"
 		stopped.Body.Text = err.Error()
@@ -1944,7 +1951,7 @@ func (s *Session) onStackTraceRequest(request *dap.StackTraceRequest) {
 	// Since the backend doesn't support paging, we load all frames up to
 	// the requested depth and then slice them here per
 	// `supportsDelayedStackTraceLoading` capability.
-	frames, err := s.debugger.Stacktrace(goroutineID, start+levels-1, 0)
+	frames, err := s.debugger.Stacktrace(int64(goroutineID), start+levels-1, 0)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToProduceStackTrace, "Unable to produce stack trace", err.Error())
 		return
@@ -1952,7 +1959,7 @@ func (s *Session) onStackTraceRequest(request *dap.StackTraceRequest) {
 
 	// Determine if the goroutine is a system goroutine.
 	isSystemGoroutine := true
-	if g, _ := s.debugger.FindGoroutine(goroutineID); g != nil {
+	if g, _ := s.debugger.FindGoroutine(int64(goroutineID)); g != nil {
 		isSystemGoroutine = g.System(s.debugger.Target())
 	}
 
@@ -2005,9 +2012,13 @@ func (s *Session) onScopesRequest(request *dap.ScopesRequest) {
 	frame := sf.(stackFrame).frameIndex
 
 	// Check if the function is optimized.
-	fn, err := s.debugger.Function(goid, frame, 0, DefaultLoadConfig)
+	fn, err := s.debugger.Function(int64(goid), frame, 0, DefaultLoadConfig)
 	if fn == nil || err != nil {
-		s.sendErrorResponse(request.Request, UnableToListArgs, "Unable to find enclosing function", err.Error())
+		var details string
+		if err != nil {
+			details = err.Error()
+		}
+		s.sendErrorResponse(request.Request, UnableToListArgs, "Unable to find enclosing function", details)
 		return
 	}
 	suffix := ""
@@ -2015,14 +2026,14 @@ func (s *Session) onScopesRequest(request *dap.ScopesRequest) {
 		suffix = " (warning: optimized function)"
 	}
 	// Retrieve arguments
-	args, err := s.debugger.FunctionArguments(goid, frame, 0, DefaultLoadConfig)
+	args, err := s.debugger.FunctionArguments(int64(goid), frame, 0, DefaultLoadConfig)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToListArgs, "Unable to list args", err.Error())
 		return
 	}
 
 	// Retrieve local variables
-	locals, err := s.debugger.LocalVariables(goid, frame, 0, DefaultLoadConfig)
+	locals, err := s.debugger.LocalVariables(int64(goid), frame, 0, DefaultLoadConfig)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToListLocals, "Unable to list locals", err.Error())
 		return
@@ -2068,7 +2079,7 @@ func (s *Session) onScopesRequest(request *dap.ScopesRequest) {
 
 	if s.args.ShowRegisters {
 		// Retrieve registers
-		regs, err := s.debugger.ScopeRegisters(goid, frame, 0, false)
+		regs, err := s.debugger.ScopeRegisters(int64(goid), frame, 0, false)
 		if err != nil {
 			s.sendErrorResponse(request.Request, UnableToListRegisters, "Unable to list registers", err.Error())
 			return
@@ -2148,10 +2159,17 @@ func (s *Session) onVariablesRequest(request *dap.VariablesRequest) {
 }
 
 func (s *Session) maybeLoadResliced(v *fullyQualifiedVariable, start, count int) (*fullyQualifiedVariable, error) {
-	if start == 0 && count == len(v.Children) {
-		// If we have already loaded the correct children,
-		// just return the variable.
-		return v, nil
+	if start == 0 {
+		want := count
+		if v.Kind == reflect.Map {
+			// For maps, we need to have 2*count children since each key-value pair is two variables.
+			want *= 2
+		}
+		if want == len(v.Children) {
+			// If we have already loaded the correct children,
+			// just return the variable.
+			return v, nil
+		}
 	}
 	indexedLoadConfig := DefaultLoadConfig
 	indexedLoadConfig.MaxArrayValues = count
@@ -2162,11 +2180,15 @@ func (s *Session) maybeLoadResliced(v *fullyQualifiedVariable, start, count int)
 	return &fullyQualifiedVariable{newV, v.fullyQualifiedNameOrExpr, false, start}, nil
 }
 
-func getIndexedVariableCount(c *proc.Variable) int {
+// getIndexedVariableCount returns the number of indexed variables
+// for a DAP variable. For maps this may be less than the actual
+// number of children returned, since a key-value pair may be split
+// into two separate children.
+func getIndexedVariableCount(v *proc.Variable) int {
 	indexedVars := 0
-	switch c.Kind {
+	switch v.Kind {
 	case reflect.Array, reflect.Slice, reflect.Map:
-		indexedVars = int(c.Len)
+		indexedVars = int(v.Len)
 	}
 	return indexedVars
 }
@@ -2583,12 +2605,15 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 // onEvaluateRequest handles 'evalute' requests.
 // This is a mandatory request to support.
 // Support the following expressions:
-// -- {expression} - evaluates the expression and returns the result as a variable
-// -- call {function} - injects a function call and returns the result as a variable
-// -- config {expression} - updates configuration parameters
+//
+//   - {expression} - evaluates the expression and returns the result as a variable
+//   - call {function} - injects a function call and returns the result as a variable
+//   - config {expression} - updates configuration parameters
+//
 // TODO(polina): users have complained about having to click to expand multi-level
 // variables, so consider also adding the following:
-// -- print {expression} - return the result as a string like from dlv cli
+//
+//   - print {expression} - return the result as a string like from dlv cli
 func (s *Session) onEvaluateRequest(request *dap.EvaluateRequest) {
 	showErrorToUser := request.Arguments.Context != "watch" && request.Arguments.Context != "repl" && request.Arguments.Context != "hover"
 	if s.debugger == nil {
@@ -2640,7 +2665,7 @@ func (s *Session) onEvaluateRequest(request *dap.EvaluateRequest) {
 			}
 		}
 	} else { // {expression}
-		exprVar, err := s.debugger.EvalVariableInScope(goid, frame, 0, expr, DefaultLoadConfig)
+		exprVar, err := s.debugger.EvalVariableInScope(int64(goid), frame, 0, expr, DefaultLoadConfig)
 		if err != nil {
 			s.sendErrorResponseWithOpts(request.Request, UnableToEvaluateExpression, "Unable to evaluate expression", err.Error(), showErrorToUser)
 			return
@@ -2654,7 +2679,7 @@ func (s *Session) onEvaluateRequest(request *dap.EvaluateRequest) {
 					// Reload the string value with a bigger limit.
 					loadCfg := DefaultLoadConfig
 					loadCfg.MaxStringLen = maxSingleStringLen
-					if v, err := s.debugger.EvalVariableInScope(goid, frame, 0, request.Arguments.Expression, loadCfg); err != nil {
+					if v, err := s.debugger.EvalVariableInScope(int64(goid), frame, 0, request.Arguments.Expression, loadCfg); err != nil {
 						s.config.log.Debugf("Failed to load more for %v: %v", request.Arguments.Expression, err)
 					} else {
 						exprVar = v
@@ -2704,7 +2729,7 @@ func (s *Session) doCall(goid, frame int, expr string) (*api.DebuggerState, []*p
 		ReturnInfoLoadConfig: api.LoadConfigFromProc(&loadCfg),
 		Expr:                 expr,
 		UnsafeCall:           false,
-		GoroutineID:          goid,
+		GoroutineID:          int64(goid),
 	}, nil)
 	if processExited(state, err) {
 		e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
@@ -2773,7 +2798,7 @@ func (s *Session) doCall(goid, frame int, expr string) (*api.DebuggerState, []*p
 func (s *Session) sendStoppedEvent(state *api.DebuggerState) {
 	stopped := &dap.StoppedEvent{Event: *newEvent("stopped")}
 	stopped.Body.AllThreadsStopped = true
-	stopped.Body.ThreadId = stoppedGoroutineID(state)
+	stopped.Body.ThreadId = int(stoppedGoroutineID(state))
 	stopped.Body.Reason = s.debugger.StopReason().String()
 	s.send(stopped)
 }
@@ -2847,7 +2872,7 @@ func (s *Session) onSetVariableRequest(request *dap.SetVariableRequest) {
 	// trying to update is valid and accessible from the top most frame & the
 	// current goroutine.
 	goid, frame := -1, 0
-	evaluated, err := s.debugger.EvalVariableInScope(goid, frame, 0, evaluateName, DefaultLoadConfig)
+	evaluated, err := s.debugger.EvalVariableInScope(int64(goid), frame, 0, evaluateName, DefaultLoadConfig)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToSetVariable, "Unable to lookup variable", err.Error())
 		return
@@ -2890,7 +2915,7 @@ func (s *Session) onSetVariableRequest(request *dap.SetVariableRequest) {
 			return
 		}
 	} else {
-		if err := s.debugger.SetVariableInScope(goid, frame, 0, evaluateName, arg.Value); err != nil {
+		if err := s.debugger.SetVariableInScope(int64(goid), frame, 0, evaluateName, arg.Value); err != nil {
 			s.sendErrorResponse(request.Request, UnableToSetVariable, "Unable to set variable", err.Error())
 			return
 		}
@@ -3139,6 +3164,10 @@ func alignPCs(bi *proc.BinaryInfo, start, end uint64) (uint64, uint64) {
 			return end < fn.Entry
 		})
 		end = bi.Functions[i].Entry
+		const limit = 10 * 1024
+		if end-start > limit {
+			end = start + limit
+		}
 	}
 
 	return start, end
@@ -3164,7 +3193,7 @@ func (s *Session) onCancelRequest(request *dap.CancelRequest) {
 // onExceptionInfoRequest handles 'exceptionInfo' requests.
 // Capability 'supportsExceptionInfoRequest' is set in 'initialize' response.
 func (s *Session) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
-	goroutineID := request.Arguments.ThreadId
+	goroutineID := int64(request.Arguments.ThreadId)
 	var body dap.ExceptionInfoResponseBody
 	// Get the goroutine and the current state.
 	g, err := s.debugger.FindGoroutine(goroutineID)
@@ -3182,8 +3211,8 @@ func (s *Session) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
 	}
 	// Check if this goroutine ID is stopped at a breakpoint.
 	includeStackTrace := true
-	if bpState != nil && bpState.Breakpoint != nil && (bpState.Breakpoint.Name == proc.FatalThrow || bpState.Breakpoint.Name == proc.UnrecoveredPanic) {
-		switch bpState.Breakpoint.Name {
+	if bpState != nil && bpState.Breakpoint != nil && bpState.Breakpoint.Logical != nil && (bpState.Breakpoint.Logical.Name == proc.FatalThrow || bpState.Breakpoint.Logical.Name == proc.UnrecoveredPanic) {
+		switch bpState.Breakpoint.Logical.Name {
 		case proc.FatalThrow:
 			body.ExceptionId = "fatal error"
 			body.Description, err = s.throwReason(goroutineID)
@@ -3248,7 +3277,7 @@ func (s *Session) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
 	s.send(response)
 }
 
-func (s *Session) stacktrace(goroutineID int, g *proc.G) (string, error) {
+func (s *Session) stacktrace(goroutineID int64, g *proc.G) (string, error) {
 	frames, err := s.debugger.Stacktrace(goroutineID, s.args.StackTraceDepth, 0)
 	if err != nil {
 		return "", err
@@ -3273,15 +3302,15 @@ func (s *Session) stacktrace(goroutineID int, g *proc.G) (string, error) {
 	return buf.String(), nil
 }
 
-func (s *Session) throwReason(goroutineID int) (string, error) {
+func (s *Session) throwReason(goroutineID int64) (string, error) {
 	return s.getExprString("s", goroutineID, 0)
 }
 
-func (s *Session) panicReason(goroutineID int) (string, error) {
+func (s *Session) panicReason(goroutineID int64) (string, error) {
 	return s.getExprString("(*msgs).arg.(data)", goroutineID, 0)
 }
 
-func (s *Session) getExprString(expr string, goroutineID, frame int) (string, error) {
+func (s *Session) getExprString(expr string, goroutineID int64, frame int) (string, error) {
 	exprVar, err := s.debugger.EvalVariableInScope(goroutineID, frame, 0, expr, DefaultLoadConfig)
 	if err != nil {
 		return "", err
@@ -3293,7 +3322,8 @@ func (s *Session) getExprString(expr string, goroutineID, frame int) (string, er
 }
 
 // sendErrorResponseWithOpts offers configuration options.
-//   showUser - if true, the error will be shown to the user (e.g. via a visible pop-up)
+//
+//	showUser - if true, the error will be shown to the user (e.g. via a visible pop-up)
 func (s *Session) sendErrorResponseWithOpts(request dap.Request, id int, summary, details string, showUser bool) {
 	er := &dap.ErrorResponse{}
 	er.Type = "response"
@@ -3469,7 +3499,7 @@ func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange cha
 				state.NextInProgress = false
 			}
 		}
-		stopped.Body.ThreadId = stoppedGoroutineID(state)
+		stopped.Body.ThreadId = int(stoppedGoroutineID(state))
 
 		switch stopReason {
 		case proc.StopNextFinished:
@@ -3482,17 +3512,18 @@ func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange cha
 			stopped.Body.Reason = "data breakpoint"
 		default:
 			stopped.Body.Reason = "breakpoint"
-			var bp *api.Breakpoint
-			if stopped.Body.ThreadId, bp = s.stoppedOnBreakpointGoroutineID(state); bp != nil {
+			goid, bp := s.stoppedOnBreakpointGoroutineID(state)
+			stopped.Body.ThreadId = int(goid)
+			if bp != nil {
 				switch bp.Name {
 				case proc.FatalThrow:
 					stopped.Body.Reason = "exception"
 					stopped.Body.Description = "fatal error"
-					stopped.Body.Text, _ = s.throwReason(stopped.Body.ThreadId)
+					stopped.Body.Text, _ = s.throwReason(int64(stopped.Body.ThreadId))
 				case proc.UnrecoveredPanic:
 					stopped.Body.Reason = "exception"
 					stopped.Body.Description = "panic"
-					stopped.Body.Text, _ = s.panicReason(stopped.Body.ThreadId)
+					stopped.Body.Text, _ = s.panicReason(int64(stopped.Body.ThreadId))
 				}
 				if strings.HasPrefix(bp.Name, functionBpPrefix) {
 					stopped.Body.Reason = "function breakpoint"
@@ -3532,7 +3563,7 @@ func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange cha
 
 		state, err := s.debugger.State( /*nowait*/ true)
 		if err == nil {
-			stopped.Body.ThreadId = stoppedGoroutineID(state)
+			stopped.Body.ThreadId = int(stoppedGoroutineID(state))
 		}
 	}
 
@@ -3606,7 +3637,7 @@ func (s *Session) handleLogPoints(state *api.DebuggerState) {
 	}
 }
 
-func (s *Session) stoppedGs(state *api.DebuggerState) (gs []int) {
+func (s *Session) stoppedGs(state *api.DebuggerState) (gs []int64) {
 	// Check the current thread first. There may be no selected goroutine.
 	if state.CurrentThread.Breakpoint != nil && !state.CurrentThread.Breakpoint.Tracepoint {
 		gs = append(gs, state.CurrentThread.GoroutineID)
@@ -3636,7 +3667,7 @@ func (s *Session) stoppedGs(state *api.DebuggerState) (gs []int) {
 	return gs
 }
 
-func (s *Session) logBreakpointMessage(bp *api.Breakpoint, goid int) bool {
+func (s *Session) logBreakpointMessage(bp *api.Breakpoint, goid int64) bool {
 	if !bp.Tracepoint {
 		return false
 	}
@@ -3657,7 +3688,7 @@ func (s *Session) logBreakpointMessage(bp *api.Breakpoint, goid int) bool {
 	return true
 }
 
-func (msg *logMessage) evaluate(s *Session, goid int) string {
+func (msg *logMessage) evaluate(s *Session, goid int64) string {
 	evaluated := make([]interface{}, len(msg.args))
 	for i := range msg.args {
 		exprVar, err := s.debugger.EvalVariableInScope(goid, 0, 0, msg.args[i], DefaultLoadConfig)
@@ -3665,7 +3696,7 @@ func (msg *logMessage) evaluate(s *Session, goid int) string {
 			evaluated[i] = fmt.Sprintf("{eval err: %e}", err)
 			continue
 		}
-		evaluated[i] = s.convertVariableToString(exprVar)
+		evaluated[i], _ = s.convertVariableWithOpts(exprVar, "", skipRef|showFullValue)
 	}
 	return fmt.Sprintf(msg.format, evaluated...)
 }
@@ -3698,7 +3729,8 @@ type logMessage struct {
 }
 
 // parseLogPoint parses a log message according to the DAP spec:
-//   "Expressions within {} are interpolated."
+//
+//	"Expressions within {} are interpolated."
 func parseLogPoint(msg string) (bool, *logMessage, error) {
 	// Note: All braces *must* come in pairs, even those within an
 	// expression to be interpolated.

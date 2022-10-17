@@ -12,7 +12,7 @@ import (
 
 // SplitQuotedFields is like strings.Fields but ignores spaces inside areas surrounded
 // by the specified quote character.
-// To specify a single quote use backslash to escape it: '\''
+// To specify a single quote use backslash to escape it: \'
 func SplitQuotedFields(in string, quote rune) []string {
 	type stateEnum int
 	const (
@@ -41,6 +41,7 @@ func SplitQuotedFields(in string, quote rune) []string {
 			} else if unicode.IsSpace(ch) {
 				r = append(r, buf.String())
 				buf.Reset()
+				state = inSpace
 			} else {
 				buf.WriteRune(ch)
 			}
@@ -60,7 +61,7 @@ func SplitQuotedFields(in string, quote rune) []string {
 		}
 	}
 
-	if buf.Len() != 0 {
+	if state == inField || buf.Len() != 0 {
 		r = append(r, buf.String())
 	}
 

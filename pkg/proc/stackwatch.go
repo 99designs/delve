@@ -72,7 +72,7 @@ func (t *Target) setStackWatchBreakpoints(scope *EvalScope, watchpoint *Breakpoi
 	retbreaklet.watchpoint = watchpoint
 	retbreaklet.callback = woos
 
-	if recorded, _ := t.Recorded(); recorded && retframe.Current.Fn != nil {
+	if recorded, _ := t.recman.Recorded(); recorded && retframe.Current.Fn != nil {
 		// Must also set a breakpoint on the call instruction immediately
 		// preceding retframe.Current.PC, because the watchpoint could also go out
 		// of scope while we are running backwards.
@@ -96,27 +96,15 @@ func (t *Target) setStackWatchBreakpoints(scope *EvalScope, watchpoint *Breakpoi
 
 	// Stack Resize Sentinel
 
-	fn := t.BinInfo().LookupFunc["runtime.copystack"]
-	if fn == nil {
-		return errors.New("could not find runtime.copystack")
-	}
-	text, err := Disassemble(t.Memory(), nil, t.Breakpoints(), t.BinInfo(), fn.Entry, fn.End)
+	retpcs, err := findRetPC(t, "runtime.copystack")
 	if err != nil {
 		return err
 	}
-	var retpc uint64
-	for _, instr := range text {
-		if instr.IsRet() {
-			if retpc != 0 {
-				return errors.New("runtime.copystack has too many return instructions")
-			}
-			retpc = instr.Loc.PC
-		}
+	if len(retpcs) > 1 {
+		return errors.New("runtime.copystack has too many return instructions")
 	}
-	if retpc == 0 {
-		return errors.New("could not find return instruction in runtime.copystack")
-	}
-	rszbp, err := t.SetBreakpoint(0, retpc, StackResizeBreakpoint, sameGCond)
+
+	rszbp, err := t.SetBreakpoint(0, retpcs[0], StackResizeBreakpoint, sameGCond)
 	if err != nil {
 		return err
 	}
@@ -164,6 +152,7 @@ func watchpointOutOfScope(t *Target, watchpoint *Breakpoint) {
 		log := logflags.DebuggerLogger()
 		log.Errorf("could not clear out-of-scope watchpoint: %v", err)
 	}
+	delete(t.Breakpoints().Logical, watchpoint.LogicalID())
 }
 
 // adjustStackWatchpoint is called when the goroutine of watchpoint resizes

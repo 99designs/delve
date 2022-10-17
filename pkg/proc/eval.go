@@ -36,6 +36,7 @@ type EvalScope struct {
 	g       *G
 	BinInfo *BinaryInfo
 	target  *Target
+	loadCfg *LoadConfig
 
 	frameOffset int64
 
@@ -72,7 +73,7 @@ const (
 // ConvertEvalScope returns a new EvalScope in the context of the
 // specified goroutine ID and stack frame.
 // If deferCall is > 0 the eval scope will be relative to the specified deferred call.
-func ConvertEvalScope(dbp *Target, gid, frame, deferCall int) (*EvalScope, error) {
+func ConvertEvalScope(dbp *Target, gid int64, frame, deferCall int) (*EvalScope, error) {
 	if _, err := dbp.Valid(); err != nil {
 		return nil, err
 	}
@@ -189,10 +190,9 @@ func (scope *EvalScope) EvalExpression(expr string, cfg LoadConfig) (*Variable, 
 		return nil, err
 	}
 
-	ev, err := scope.evalToplevelTypeCast(t, cfg)
-	if ev == nil && err == nil {
-		ev, err = scope.evalAST(t)
-	}
+	scope.loadCfg = &cfg
+
+	ev, err := scope.evalAST(t)
 	if err != nil {
 		scope.callCtx.doReturn(nil, err)
 		return nil, err
@@ -338,17 +338,17 @@ func afterLastArgAddr(vars []*Variable) uint64 {
 }
 
 // setValue writes the value of srcv to dstv.
-// * If srcv is a numerical literal constant and srcv is of a compatible type
-//   the necessary type conversion is performed.
-// * If srcv is nil and dstv is of a nil'able type then dstv is nilled.
-// * If srcv is the empty string and dstv is a string then dstv is set to the
-//   empty string.
-// * If dstv is an "interface {}" and srcv is either an interface (possibly
-//   non-empty) or a pointer shaped type (map, channel, pointer or struct
-//   containing a single pointer field) the type conversion to "interface {}"
-//   is performed.
-// * If srcv and dstv have the same type and are both addressable then the
-//   contents of srcv are copied byte-by-byte into dstv
+//   - If srcv is a numerical literal constant and srcv is of a compatible type
+//     the necessary type conversion is performed.
+//   - If srcv is nil and dstv is of a nil'able type then dstv is nilled.
+//   - If srcv is the empty string and dstv is a string then dstv is set to the
+//     empty string.
+//   - If dstv is an "interface {}" and srcv is either an interface (possibly
+//     non-empty) or a pointer shaped type (map, channel, pointer or struct
+//     containing a single pointer field) the type conversion to "interface {}"
+//     is performed.
+//   - If srcv and dstv have the same type and are both addressable then the
+//     contents of srcv are copied byte-by-byte into dstv
 func (scope *EvalScope) setValue(dstv, srcv *Variable, srcExpr string) error {
 	srcv.loadValue(loadSingleValue)
 
@@ -615,133 +615,6 @@ func (scope *EvalScope) PtrSize() int {
 	return scope.BinInfo.Arch.PtrSize()
 }
 
-// evalToplevelTypeCast implements certain type casts that we only support
-// at the outermost levels of an expression.
-func (scope *EvalScope) evalToplevelTypeCast(t ast.Expr, cfg LoadConfig) (*Variable, error) {
-	call, _ := t.(*ast.CallExpr)
-	if call == nil || len(call.Args) != 1 {
-		return nil, nil
-	}
-	targetTypeStr := exprToString(removeParen(call.Fun))
-	var targetType godwarf.Type
-	switch targetTypeStr {
-	case "[]byte", "[]uint8":
-		targetType = fakeSliceType(&godwarf.IntType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 1, Name: "uint8"}, BitSize: 8, BitOffset: 0}})
-	case "[]int32", "[]rune":
-		targetType = fakeSliceType(&godwarf.IntType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 1, Name: "int32"}, BitSize: 32, BitOffset: 0}})
-	case "string":
-		var err error
-		targetType, err = scope.BinInfo.findType("string")
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return nil, nil
-	}
-
-	argv, err := scope.evalToplevelTypeCast(call.Args[0], cfg)
-	if argv == nil && err == nil {
-		argv, err = scope.evalAST(call.Args[0])
-	}
-	if err != nil {
-		return nil, err
-	}
-	argv.loadValue(cfg)
-	if argv.Unreadable != nil {
-		return nil, argv.Unreadable
-	}
-
-	v := newVariable("", 0, targetType, scope.BinInfo, scope.Mem)
-	v.loaded = true
-
-	converr := fmt.Errorf("can not convert %q to %s", exprToString(call.Args[0]), targetTypeStr)
-
-	switch targetTypeStr {
-	case "[]byte", "[]uint8":
-		if argv.Kind != reflect.String {
-			return nil, converr
-		}
-		for i, ch := range []byte(constant.StringVal(argv.Value)) {
-			e := newVariable("", argv.Addr+uint64(i), targetType.(*godwarf.SliceType).ElemType, scope.BinInfo, argv.mem)
-			e.loaded = true
-			e.Value = constant.MakeInt64(int64(ch))
-			v.Children = append(v.Children, *e)
-		}
-		v.Len = int64(len(v.Children))
-		v.Cap = v.Len
-		return v, nil
-
-	case "[]int32", "[]rune":
-		if argv.Kind != reflect.String {
-			return nil, converr
-		}
-		for i, ch := range constant.StringVal(argv.Value) {
-			e := newVariable("", argv.Addr+uint64(i), targetType.(*godwarf.SliceType).ElemType, scope.BinInfo, argv.mem)
-			e.loaded = true
-			e.Value = constant.MakeInt64(int64(ch))
-			v.Children = append(v.Children, *e)
-		}
-		v.Len = int64(len(v.Children))
-		v.Cap = v.Len
-		return v, nil
-
-	case "string":
-		switch argv.Kind {
-		case reflect.String:
-			s := constant.StringVal(argv.Value)
-			v.Value = constant.MakeString(s)
-			v.Len = int64(len(s))
-			return v, nil
-		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
-			b, _ := constant.Int64Val(argv.Value)
-			s := string(rune(b))
-			v.Value = constant.MakeString(s)
-			v.Len = int64(len(s))
-			return v, nil
-		case reflect.Slice, reflect.Array:
-			var elem godwarf.Type
-			if argv.Kind == reflect.Slice {
-				elem = argv.RealType.(*godwarf.SliceType).ElemType
-			} else {
-				elem = argv.RealType.(*godwarf.ArrayType).Type
-			}
-			switch elemType := elem.(type) {
-			case *godwarf.UintType:
-				if elemType.Name != "uint8" && elemType.Name != "byte" {
-					return nil, nil
-				}
-				bytes := make([]byte, len(argv.Children))
-				for i := range argv.Children {
-					n, _ := constant.Int64Val(argv.Children[i].Value)
-					bytes[i] = byte(n)
-				}
-				v.Value = constant.MakeString(string(bytes))
-
-			case *godwarf.IntType:
-				if elemType.Name != "int32" && elemType.Name != "rune" {
-					return nil, nil
-				}
-				runes := make([]rune, len(argv.Children))
-				for i := range argv.Children {
-					n, _ := constant.Int64Val(argv.Children[i].Value)
-					runes[i] = rune(n)
-				}
-				v.Value = constant.MakeString(string(runes))
-
-			default:
-				return nil, nil
-			}
-			v.Len = int64(len(constant.StringVal(v.Value)))
-			return v, nil
-
-		default:
-			return nil, nil
-		}
-	}
-
-	return nil, nil
-}
-
 func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
 	switch node := t.(type) {
 	case *ast.CallExpr:
@@ -914,23 +787,34 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 	if err != nil {
 		return nil, err
 	}
-	argv.loadValue(loadSingleValue)
-	if argv.Unreadable != nil {
-		return nil, argv.Unreadable
-	}
 
 	fnnode := node.Fun
 
 	// remove all enclosing parenthesis from the type name
 	fnnode = removeParen(fnnode)
 
+	targetTypeStr := exprToString(removeParen(node.Fun))
 	styp, err := scope.BinInfo.findTypeExpr(fnnode)
 	if err != nil {
-		return nil, err
+		switch targetTypeStr {
+		case "[]byte", "[]uint8":
+			styp = fakeSliceType(fakeBasicType("uint", 8))
+		case "[]int32", "[]rune":
+			styp = fakeSliceType(fakeBasicType("int", 32))
+		default:
+			return nil, err
+		}
 	}
 	typ := resolveTypedef(styp)
 
 	converr := fmt.Errorf("can not convert %q to %s", exprToString(node.Args[0]), typ.String())
+
+	// compatible underlying types
+	if typeCastCompatibleTypes(argv.RealType, typ) {
+		argv.RealType = typ
+		argv.DwarfType = styp
+		return argv, nil
+	}
 
 	v := newVariable("", 0, styp, scope.BinInfo, scope.Mem)
 	v.loaded = true
@@ -944,6 +828,11 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 			// ok
 		default:
 			return nil, converr
+		}
+
+		argv.loadValue(loadSingleValue)
+		if argv.Unreadable != nil {
+			return nil, argv.Unreadable
 		}
 
 		n, _ := constant.Int64Val(argv.Value)
@@ -960,6 +849,10 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 		return v, nil
 
 	case *godwarf.UintType:
+		argv.loadValue(loadSingleValue)
+		if argv.Unreadable != nil {
+			return nil, argv.Unreadable
+		}
 		switch argv.Kind {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			n, _ := constant.Int64Val(argv.Value)
@@ -978,6 +871,10 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 			return v, nil
 		}
 	case *godwarf.IntType:
+		argv.loadValue(loadSingleValue)
+		if argv.Unreadable != nil {
+			return nil, argv.Unreadable
+		}
 		switch argv.Kind {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			n, _ := constant.Int64Val(argv.Value)
@@ -993,6 +890,10 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 			return v, nil
 		}
 	case *godwarf.FloatType:
+		argv.loadValue(loadSingleValue)
+		if argv.Unreadable != nil {
+			return nil, argv.Unreadable
+		}
 		switch argv.Kind {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			fallthrough
@@ -1003,6 +904,10 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 			return v, nil
 		}
 	case *godwarf.ComplexType:
+		argv.loadValue(loadSingleValue)
+		if argv.Unreadable != nil {
+			return nil, argv.Unreadable
+		}
 		switch argv.Kind {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			fallthrough
@@ -1014,7 +919,163 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 		}
 	}
 
+	cfg := loadFullValue
+	if scope.loadCfg != nil {
+		cfg = *scope.loadCfg
+	}
+	argv.loadValue(cfg)
+	if argv.Unreadable != nil {
+		return nil, argv.Unreadable
+	}
+
+	switch ttyp := typ.(type) {
+	case *godwarf.SliceType:
+		switch ttyp.ElemType.Common().ReflectKind {
+		case reflect.Uint8:
+			if argv.Kind != reflect.String {
+				return nil, converr
+			}
+			for i, ch := range []byte(constant.StringVal(argv.Value)) {
+				e := newVariable("", argv.Addr+uint64(i), typ.(*godwarf.SliceType).ElemType, scope.BinInfo, argv.mem)
+				e.loaded = true
+				e.Value = constant.MakeInt64(int64(ch))
+				v.Children = append(v.Children, *e)
+			}
+			v.Len = int64(len(v.Children))
+			v.Cap = v.Len
+			return v, nil
+
+		case reflect.Int32:
+			if argv.Kind != reflect.String {
+				return nil, converr
+			}
+			for i, ch := range constant.StringVal(argv.Value) {
+				e := newVariable("", argv.Addr+uint64(i), typ.(*godwarf.SliceType).ElemType, scope.BinInfo, argv.mem)
+				e.loaded = true
+				e.Value = constant.MakeInt64(int64(ch))
+				v.Children = append(v.Children, *e)
+			}
+			v.Len = int64(len(v.Children))
+			v.Cap = v.Len
+			return v, nil
+		}
+
+	case *godwarf.StringType:
+		switch argv.Kind {
+		case reflect.String:
+			s := constant.StringVal(argv.Value)
+			v.Value = constant.MakeString(s)
+			v.Len = int64(len(s))
+			return v, nil
+		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
+			b, _ := constant.Int64Val(argv.Value)
+			s := string(rune(b))
+			v.Value = constant.MakeString(s)
+			v.Len = int64(len(s))
+			return v, nil
+		case reflect.Slice, reflect.Array:
+			var elem godwarf.Type
+			if argv.Kind == reflect.Slice {
+				elem = argv.RealType.(*godwarf.SliceType).ElemType
+			} else {
+				elem = argv.RealType.(*godwarf.ArrayType).Type
+			}
+			switch elemType := elem.(type) {
+			case *godwarf.UintType:
+				if elemType.Name != "uint8" && elemType.Name != "byte" {
+					return nil, converr
+				}
+				bytes := make([]byte, len(argv.Children))
+				for i := range argv.Children {
+					n, _ := constant.Int64Val(argv.Children[i].Value)
+					bytes[i] = byte(n)
+				}
+				v.Value = constant.MakeString(string(bytes))
+
+			case *godwarf.IntType:
+				if elemType.Name != "int32" && elemType.Name != "rune" {
+					return nil, converr
+				}
+				runes := make([]rune, len(argv.Children))
+				for i := range argv.Children {
+					n, _ := constant.Int64Val(argv.Children[i].Value)
+					runes[i] = rune(n)
+				}
+				v.Value = constant.MakeString(string(runes))
+
+			default:
+				return nil, converr
+			}
+			v.Len = int64(len(constant.StringVal(v.Value)))
+			return v, nil
+		}
+	}
+
 	return nil, converr
+}
+
+// typeCastCompatibleTypes returns true if typ1 and typ2 are compatible for
+// a type cast where only the type of the variable is changed.
+func typeCastCompatibleTypes(typ1, typ2 godwarf.Type) bool {
+	if typ1 == nil || typ2 == nil || typ1.Common().Size() != typ2.Common().Size() || typ1.Common().Align() != typ2.Common().Align() {
+		return false
+	}
+
+	if typ1.String() == typ2.String() {
+		return true
+	}
+
+	switch ttyp1 := typ1.(type) {
+	case *godwarf.PtrType:
+		if ttyp2, ok := typ2.(*godwarf.PtrType); ok {
+			// pointer types are compatible if their element types are compatible
+			return typeCastCompatibleTypes(resolveTypedef(ttyp1.Type), resolveTypedef(ttyp2.Type))
+		}
+	case *godwarf.StringType:
+		if _, ok := typ2.(*godwarf.StringType); ok {
+			return true
+		}
+	case *godwarf.StructType:
+		if ttyp2, ok := typ2.(*godwarf.StructType); ok {
+			// struct types are compatible if they have the same fields
+			if len(ttyp1.Field) != len(ttyp2.Field) {
+				return false
+			}
+			for i := range ttyp1.Field {
+				if *ttyp1.Field[i] != *ttyp2.Field[i] {
+					return false
+				}
+			}
+			return true
+		}
+	case *godwarf.ComplexType:
+		if _, ok := typ2.(*godwarf.ComplexType); ok {
+			// size and alignment already checked above
+			return true
+		}
+	case *godwarf.FloatType:
+		if _, ok := typ2.(*godwarf.FloatType); ok {
+			// size and alignment already checked above
+			return true
+		}
+	case *godwarf.IntType:
+		if _, ok := typ2.(*godwarf.IntType); ok {
+			// size and alignment already checked above
+			return true
+		}
+	case *godwarf.UintType:
+		if _, ok := typ2.(*godwarf.UintType); ok {
+			// size and alignment already checked above
+			return true
+		}
+	case *godwarf.BoolType:
+		if _, ok := typ2.(*godwarf.BoolType); ok {
+			// size and alignment already checked above
+			return true
+		}
+	}
+
+	return false
 }
 
 func convertInt(n uint64, signed bool, size int64) uint64 {
@@ -1183,7 +1244,7 @@ func complexBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 		sz = 128
 	}
 
-	typ := &godwarf.ComplexType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: int64(sz / 8), Name: fmt.Sprintf("complex%d", sz)}, BitSize: sz, BitOffset: 0}}
+	typ := fakeBasicType("complex", int(sz))
 
 	r := realev.newVariable("", 0, typ, nil)
 	r.Value = constant.BinaryOp(realev.Value, token.ADD, constant.MakeImag(imagev.Value))
@@ -1263,7 +1324,7 @@ func (scope *EvalScope) evalIdent(node *ast.Ident) (*Variable, error) {
 
 				var typ godwarf.Type
 				if len(reg.Bytes) <= 8 {
-					typ = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 8, Name: "uint64"}, BitSize: 64, BitOffset: 0}}
+					typ = fakeBasicType("uint", 64)
 				} else {
 					typ, err = scope.BinInfo.findType("string")
 					if err != nil {
@@ -2038,10 +2099,18 @@ func (v *Variable) mapAccess(idx *Variable) (*Variable, error) {
 		return nil, fmt.Errorf("can not access unreadable map: %v", v.Unreadable)
 	}
 
+	lcfg := loadFullValue
+	if idx.Kind == reflect.String && int64(len(constant.StringVal(idx.Value))) == idx.Len && idx.Len > int64(lcfg.MaxStringLen) {
+		// If the index is a string load as much of the keys to at least match the length of the index.
+		//TODO(aarzilli): when struct literals are implemented this needs to be
+		//done recursively for literal struct fields.
+		lcfg.MaxStringLen = int(idx.Len)
+	}
+
 	first := true
 	for it.next() {
 		key := it.key()
-		key.loadValue(loadFullValue)
+		key.loadValue(lcfg)
 		if key.Unreadable != nil {
 			return nil, fmt.Errorf("can not access unreadable map: %v", key.Unreadable)
 		}
@@ -2234,6 +2303,36 @@ func functionToVariable(fn *Function, bi *BinaryInfo, mem MemoryReadWriter) (*Va
 	v.loaded = true
 	v.Base = fn.Entry
 	return v, nil
+}
+
+func fakeBasicType(name string, bitSize int) godwarf.Type {
+	byteSize := bitSize / 8
+	szr := popcnt(uint64(byteSize^(byteSize-1))) - 1 // position of rightmost 1 bit, minus 1
+
+	basic := func(kind reflect.Kind) godwarf.BasicType {
+		return godwarf.BasicType{
+			CommonType: godwarf.CommonType{
+				ByteSize:    int64(byteSize),
+				Name:        fmt.Sprintf("%s%d", name, bitSize),
+				ReflectKind: kind,
+			},
+			BitSize:   int64(bitSize),
+			BitOffset: 0,
+		}
+	}
+
+	switch name {
+	case "int":
+		return &godwarf.IntType{BasicType: basic(reflect.Int8 + reflect.Kind(szr))}
+	case "uint":
+		return &godwarf.UintType{BasicType: basic(reflect.Uint8 + reflect.Kind(szr))}
+	case "float":
+		return &godwarf.FloatType{BasicType: basic(reflect.Float32 + reflect.Kind(szr-2))}
+	case "complex":
+		return &godwarf.ComplexType{BasicType: basic(reflect.Complex64 + reflect.Kind(szr-3))}
+	default:
+		panic("unsupported")
+	}
 }
 
 func fakeSliceType(fieldType godwarf.Type) godwarf.Type {

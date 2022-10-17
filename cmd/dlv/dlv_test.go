@@ -111,8 +111,13 @@ func TestBuild(t *testing.T) {
 
 	scan := bufio.NewScanner(stderr)
 	// wait for the debugger to start
-	scan.Scan()
-	t.Log(scan.Text())
+	for scan.Scan() {
+		text := scan.Text()
+		t.Log(text)
+		if strings.Contains(text, "API server pid = ") {
+			break
+		}
+	}
 	go func() {
 		for scan.Scan() {
 			t.Log(scan.Text())
@@ -455,9 +460,10 @@ func TestGeneratedDoc(t *testing.T) {
 	checkAutogenDoc(t, "pkg/terminal/starbind/starlark_mapping.go", "'go generate' inside pkg/terminal/starbind", runScript("_scripts/gen-starlark-bindings.go", "go", "-"))
 	checkAutogenDoc(t, "Documentation/cli/starlark.md", "'go generate' inside pkg/terminal/starbind", runScript("_scripts/gen-starlark-bindings.go", "doc/dummy", "Documentation/cli/starlark.md"))
 	checkAutogenDoc(t, "Documentation/backend_test_health.md", "go run _scripts/gen-backend_test_health.go", runScript("_scripts/gen-backend_test_health.go", "-"))
-	checkAutogenDoc(t, "_scripts/rtype-out.txt", "go run _scripts/rtype.go report _scripts/rtype-out.txt", runScript("_scripts/rtype.go", "report"))
-
-	runScript("_scripts/rtype.go", "check")
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 18) {
+		checkAutogenDoc(t, "_scripts/rtype-out.txt", "go run _scripts/rtype.go report _scripts/rtype-out.txt", runScript("_scripts/rtype.go", "report"))
+		runScript("_scripts/rtype.go", "check")
+	}
 }
 
 func TestExitInInit(t *testing.T) {
@@ -754,10 +760,12 @@ func TestDAPCmdWithNoDebugBinary(t *testing.T) {
 	cmd.Wait()
 }
 
-func newDAPRemoteClient(t *testing.T, addr string) *daptest.Client {
+func newDAPRemoteClient(t *testing.T, addr string, isDlvAttach bool, isMulti bool) *daptest.Client {
 	c := daptest.NewClient(addr)
 	c.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
-	c.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
+	if isDlvAttach || isMulti {
+		c.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
+	}
 	c.ExpectInitializedEvent(t)
 	c.ExpectAttachResponse(t)
 	c.ConfigurationDoneRequest()
@@ -794,7 +802,7 @@ func TestRemoteDAPClient(t *testing.T) {
 		}
 	}()
 
-	client := newDAPRemoteClient(t, listenAddr)
+	client := newDAPRemoteClient(t, listenAddr, false, false)
 	client.ContinueRequest(1)
 	client.ExpectContinueResponse(t)
 	client.ExpectTerminatedEvent(t)
@@ -854,7 +862,7 @@ func TestRemoteDAPClientMulti(t *testing.T) {
 	dapclient0.ExpectErrorResponse(t)
 
 	// Client 1 connects and continues to main.main
-	dapclient := newDAPRemoteClient(t, listenAddr)
+	dapclient := newDAPRemoteClient(t, listenAddr, false, true)
 	dapclient.SetFunctionBreakpointsRequest([]godap.FunctionBreakpoint{{Name: "main.main"}})
 	dapclient.ExpectSetFunctionBreakpointsResponse(t)
 	dapclient.ContinueRequest(1)
@@ -864,7 +872,7 @@ func TestRemoteDAPClientMulti(t *testing.T) {
 	closeDAPRemoteMultiClient(t, dapclient, "halted")
 
 	// Client 2 reconnects at main.main and continues to process exit
-	dapclient2 := newDAPRemoteClient(t, listenAddr)
+	dapclient2 := newDAPRemoteClient(t, listenAddr, false, true)
 	dapclient2.CheckStopLocation(t, 1, "main.main", 5)
 	dapclient2.ContinueRequest(1)
 	dapclient2.ExpectContinueResponse(t)
@@ -924,7 +932,7 @@ func TestRemoteDAPClientAfterContinue(t *testing.T) {
 		}
 	}()
 
-	c := newDAPRemoteClient(t, listenAddr)
+	c := newDAPRemoteClient(t, listenAddr, false, true)
 	c.ContinueRequest(1)
 	c.ExpectContinueResponse(t)
 	c.DisconnectRequest()
@@ -933,7 +941,7 @@ func TestRemoteDAPClientAfterContinue(t *testing.T) {
 	c.ExpectTerminatedEvent(t)
 	c.Close()
 
-	c = newDAPRemoteClient(t, listenAddr)
+	c = newDAPRemoteClient(t, listenAddr, false, true)
 	c.DisconnectRequestWithKillOption(true)
 	c.ExpectOutputEventDetachingKill(t)
 	c.ExpectDisconnectResponse(t)
@@ -991,7 +999,7 @@ func TestTrace(t *testing.T) {
 	dlvbin, tmpdir := getDlvBin(t)
 	defer os.RemoveAll(tmpdir)
 
-	expected := []byte("> goroutine(1): main.foo(99, 9801) => (9900)\n")
+	expected := []byte("> goroutine(1): main.foo(99, 9801)\n>> goroutine(1): => (9900)\n")
 
 	fixtures := protest.FindFixturesDir()
 	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(tmpdir, "__debug"), filepath.Join(fixtures, "issue573.go"), "foo")
@@ -1012,6 +1020,43 @@ func TestTrace(t *testing.T) {
 	cmd.Wait()
 }
 
+func TestTraceMultipleGoroutines(t *testing.T) {
+	if runtime.GOOS == "freebsd" {
+		//TODO(aarzilli): investigate further when the FreeBSD backend is more stable.
+		t.Skip("temporarily disabled due to issues with FreeBSD in Delve and Go")
+	}
+
+	dlvbin, tmpdir := getDlvBin(t)
+	defer os.RemoveAll(tmpdir)
+
+	// TODO(derekparker) this test has to be a bit vague to avoid flakyness.
+	// I think a future improvement could be to use regexp captures to match the
+	// goroutine IDs at function entry and exit.
+	expected := []byte("main.callme(0, \"five\")\n")
+	expected2 := []byte("=> (0)\n")
+
+	fixtures := protest.FindFixturesDir()
+	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(tmpdir, "__debug"), filepath.Join(fixtures, "goroutines-trace.go"), "callme")
+	rdr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stderr pipe")
+	defer rdr.Close()
+
+	cmd.Dir = filepath.Join(fixtures, "buildtest")
+
+	assertNoError(cmd.Start(), t, "running trace")
+
+	output, err := ioutil.ReadAll(rdr)
+	assertNoError(err, t, "ReadAll")
+
+	if !bytes.Contains(output, expected) {
+		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
+	}
+	if !bytes.Contains(output, expected2) {
+		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
+	}
+	cmd.Wait()
+}
+
 func TestTracePid(t *testing.T) {
 	if runtime.GOOS == "linux" {
 		bs, _ := ioutil.ReadFile("/proc/sys/kernel/yama/ptrace_scope")
@@ -1024,7 +1069,7 @@ func TestTracePid(t *testing.T) {
 	dlvbin, tmpdir := getDlvBin(t)
 	defer os.RemoveAll(tmpdir)
 
-	expected := []byte("goroutine(1): main.A()\n => ()\n")
+	expected := []byte("goroutine(1): main.A()\n>> goroutine(1): => ()\n")
 
 	// make process run
 	fix := protest.BuildFixture("issue2023", 0)
@@ -1144,6 +1189,67 @@ func TestTraceEBPF(t *testing.T) {
 	cmd.Wait()
 }
 
+func TestTraceEBPF2(t *testing.T) {
+	if os.Getenv("CI") == "true" {
+		t.Skip("cannot run test in CI, requires kernel compiled with btf support")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("not implemented on non linux/amd64 systems")
+	}
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 16) {
+		t.Skip("requires at least Go 1.16 to run test")
+	}
+	usr, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usr.Uid != "0" {
+		t.Skip("test must be run as root")
+	}
+
+	dlvbin, tmpdir := getDlvBinEBPF(t)
+	defer os.RemoveAll(tmpdir)
+
+	expected := []byte(`> (1) main.callme(10)
+> (1) main.callme(9)
+> (1) main.callme(8)
+> (1) main.callme(7)
+> (1) main.callme(6)
+> (1) main.callme(5)
+> (1) main.callme(4)
+> (1) main.callme(3)
+> (1) main.callme(2)
+> (1) main.callme(1)
+> (1) main.callme(0)
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"
+=> "100"`)
+
+	fixtures := protest.FindFixturesDir()
+	cmd := exec.Command(dlvbin, "trace", "--ebpf", "--output", filepath.Join(tmpdir, "__debug"), filepath.Join(fixtures, "ebpf_trace.go"), "main.callme")
+	rdr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stderr pipe")
+	defer rdr.Close()
+
+	assertNoError(cmd.Start(), t, "running trace")
+
+	output, err := ioutil.ReadAll(rdr)
+	assertNoError(err, t, "ReadAll")
+
+	if !bytes.Contains(output, expected) {
+		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
+	}
+	cmd.Wait()
+}
+
 func TestDlvTestChdir(t *testing.T) {
 	dlvbin, tmpdir := getDlvBin(t)
 	defer os.RemoveAll(tmpdir)
@@ -1180,10 +1286,6 @@ func TestVersion(t *testing.T) {
 }
 
 func TestStaticcheck(t *testing.T) {
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 18) {
-		//TODO(aarzilli): remove this before version 1.8.0 is released
-		t.Skip("staticcheck does not currently support Go 1.18")
-	}
 	_, err := exec.LookPath("staticcheck")
 	if err != nil {
 		t.Skip("staticcheck not installed")

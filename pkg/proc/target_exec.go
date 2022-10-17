@@ -26,27 +26,32 @@ func (err *ErrNoSourceForPC) Error() string {
 	return fmt.Sprintf("no source for PC %#x", err.pc)
 }
 
-// Next continues execution until the next source line.
-func (dbp *Target) Next() (err error) {
-	if _, err := dbp.Valid(); err != nil {
+// Next resumes the processes in the group, continuing the selected target
+// until the next source line.
+func (grp *TargetGroup) Next() (err error) {
+	if _, err := grp.Valid(); err != nil {
 		return err
 	}
-	if dbp.Breakpoints().HasSteppingBreakpoints() {
+	if grp.HasSteppingBreakpoints() {
 		return fmt.Errorf("next while nexting")
 	}
 
-	if err = next(dbp, false, false); err != nil {
-		dbp.ClearSteppingBreakpoints()
+	if err = next(grp.Selected, false, false); err != nil {
+		grp.Selected.ClearSteppingBreakpoints()
 		return
 	}
 
-	return dbp.Continue()
+	return grp.Continue()
 }
 
 // Continue continues execution of the debugged
-// process. It will continue until it hits a breakpoint
+// processes. It will continue until it hits a breakpoint
 // or is otherwise stopped.
-func (dbp *Target) Continue() error {
+func (grp *TargetGroup) Continue() error {
+	if len(grp.targets) != 1 {
+		panic("multiple targets not implemented")
+	}
+	dbp := grp.Selected
 	if _, err := dbp.Valid(); err != nil {
 		return err
 	}
@@ -56,29 +61,29 @@ func (dbp *Target) Continue() error {
 	}
 	dbp.Breakpoints().WatchOutOfScope = nil
 	dbp.clearHardcodedBreakpoints()
-	dbp.cctx.CheckAndClearManualStopRequest()
+	grp.cctx.CheckAndClearManualStopRequest()
 	defer func() {
 		// Make sure we clear internal breakpoints if we simultaneously receive a
 		// manual stop request and hit a breakpoint.
-		if dbp.cctx.CheckAndClearManualStopRequest() {
+		if grp.cctx.CheckAndClearManualStopRequest() {
 			dbp.StopReason = StopManual
 			dbp.clearHardcodedBreakpoints()
-			if dbp.KeepSteppingBreakpoints&HaltKeepsSteppingBreakpoints == 0 {
+			if grp.KeepSteppingBreakpoints&HaltKeepsSteppingBreakpoints == 0 {
 				dbp.ClearSteppingBreakpoints()
 			}
 		}
 	}()
 	for {
-		if dbp.cctx.CheckAndClearManualStopRequest() {
+		if grp.cctx.CheckAndClearManualStopRequest() {
 			dbp.StopReason = StopManual
 			dbp.clearHardcodedBreakpoints()
-			if dbp.KeepSteppingBreakpoints&HaltKeepsSteppingBreakpoints == 0 {
+			if grp.KeepSteppingBreakpoints&HaltKeepsSteppingBreakpoints == 0 {
 				dbp.ClearSteppingBreakpoints()
 			}
 			return nil
 		}
 		dbp.ClearCaches()
-		trapthread, stopReason, contOnceErr := dbp.proc.ContinueOnce(dbp.cctx)
+		trapthread, stopReason, contOnceErr := grp.continueOnce([]ProcessInternal{grp.targets[0].proc}, grp.cctx)
 		dbp.StopReason = stopReason
 
 		threads := dbp.ThreadList()
@@ -136,7 +141,7 @@ func (dbp *Target) Continue() error {
 				if err := conditionErrors(threads); err != nil {
 					return err
 				}
-				if dbp.GetDirection() == Forward {
+				if grp.GetDirection() == Forward {
 					text, err := disassembleCurrentInstruction(dbp, curthread, 0)
 					if err != nil {
 						return err
@@ -155,7 +160,7 @@ func (dbp *Target) Continue() error {
 					if err := dbp.ClearSteppingBreakpoints(); err != nil {
 						return err
 					}
-					return dbp.StepInstruction()
+					return grp.StepInstruction()
 				}
 			} else {
 				curthread.Common().returnValues = curbp.Breakpoint.returnInfo.Collect(dbp, curthread)
@@ -171,13 +176,13 @@ func (dbp *Target) Continue() error {
 				return err
 			}
 			if onNextGoroutine &&
-				((!curbp.Tracepoint && !curbp.TraceReturn) || dbp.KeepSteppingBreakpoints&TracepointKeepsSteppingBreakpoints == 0) {
+				(!isTraceOrTraceReturn(curbp.Breakpoint) || grp.KeepSteppingBreakpoints&TracepointKeepsSteppingBreakpoints == 0) {
 				err := dbp.ClearSteppingBreakpoints()
 				if err != nil {
 					return err
 				}
 			}
-			if curbp.Name == UnrecoveredPanic {
+			if curbp.LogicalID() == unrecoveredPanicID {
 				dbp.ClearSteppingBreakpoints()
 			}
 			if curbp.LogicalID() != hardcodedBreakpointID {
@@ -199,6 +204,13 @@ func (dbp *Target) Continue() error {
 	}
 }
 
+func isTraceOrTraceReturn(bp *Breakpoint) bool {
+	if bp.Logical == nil {
+		return false
+	}
+	return bp.Logical.Tracepoint || bp.Logical.TraceReturn
+}
+
 func conditionErrors(threads []Thread) error {
 	var condErr error
 	for _, th := range threads {
@@ -214,9 +226,9 @@ func conditionErrors(threads []Thread) error {
 }
 
 // pick a new dbp.currentThread, with the following priority:
-// 	- a thread with an active stepping breakpoint
-// 	- a thread with an active breakpoint, prioritizing trapthread
-// 	- trapthread
+//   - a thread with an active stepping breakpoint
+//   - a thread with an active breakpoint, prioritizing trapthread
+//   - trapthread
 func pickCurrentThread(dbp *Target, trapthread Thread, threads []Thread) error {
 	for _, th := range threads {
 		if bp := th.Breakpoint(); bp.Active && bp.Stepping {
@@ -280,27 +292,27 @@ func stepInstructionOut(dbp *Target, curthread Thread, fnname1, fnname2 string) 
 	}
 }
 
-// Step will continue until another source line is reached.
-// Will step into functions.
-func (dbp *Target) Step() (err error) {
-	if _, err := dbp.Valid(); err != nil {
+// Step resumes the processes in the group, continuing the selected target
+// until the next source line. Will step into functions.
+func (grp *TargetGroup) Step() (err error) {
+	if _, err := grp.Valid(); err != nil {
 		return err
 	}
-	if dbp.Breakpoints().HasSteppingBreakpoints() {
+	if grp.HasSteppingBreakpoints() {
 		return fmt.Errorf("next while nexting")
 	}
 
-	if err = next(dbp, true, false); err != nil {
-		_ = dbp.ClearSteppingBreakpoints()
+	if err = next(grp.Selected, true, false); err != nil {
+		_ = grp.Selected.ClearSteppingBreakpoints()
 		return err
 	}
 
-	if bpstate := dbp.CurrentThread().Breakpoint(); bpstate.Breakpoint != nil && bpstate.Active && bpstate.SteppingInto && dbp.GetDirection() == Backward {
-		dbp.ClearSteppingBreakpoints()
-		return dbp.StepInstruction()
+	if bpstate := grp.Selected.CurrentThread().Breakpoint(); bpstate.Breakpoint != nil && bpstate.Active && bpstate.SteppingInto && grp.GetDirection() == Backward {
+		grp.Selected.ClearSteppingBreakpoints()
+		return grp.StepInstruction()
 	}
 
-	return dbp.Continue()
+	return grp.Continue()
 }
 
 // sameGoroutineCondition returns an expression that evaluates to true when
@@ -316,17 +328,19 @@ func frameoffCondition(frame *Stackframe) ast.Expr {
 	return astutil.Eql(astutil.PkgVar("runtime", "frameoff"), astutil.Int(frame.FrameOffset()))
 }
 
-// StepOut will continue until the current goroutine exits the
-// function currently being executed or a deferred function is executed
-func (dbp *Target) StepOut() error {
-	backward := dbp.GetDirection() == Backward
-	if _, err := dbp.Valid(); err != nil {
+// StepOut resumes the processes in the group, continuing the selected target
+// until until the current goroutine exits the function currently being
+// executed or a deferred function is executed
+func (grp *TargetGroup) StepOut() error {
+	backward := grp.GetDirection() == Backward
+	if _, err := grp.Valid(); err != nil {
 		return err
 	}
-	if dbp.Breakpoints().HasSteppingBreakpoints() {
+	if grp.HasSteppingBreakpoints() {
 		return fmt.Errorf("next while nexting")
 	}
 
+	dbp := grp.Selected
 	selg := dbp.SelectedGoroutine()
 	curthread := dbp.CurrentThread()
 
@@ -348,7 +362,7 @@ func (dbp *Target) StepOut() error {
 		}
 
 		success = true
-		return dbp.Continue()
+		return grp.Continue()
 	}
 
 	sameGCond := sameGoroutineCondition(selg)
@@ -359,7 +373,7 @@ func (dbp *Target) StepOut() error {
 		}
 
 		success = true
-		return dbp.Continue()
+		return grp.Continue()
 	}
 
 	deferpc, err := setDeferBreakpoint(dbp, nil, topframe, sameGCond, false)
@@ -388,14 +402,15 @@ func (dbp *Target) StepOut() error {
 	}
 
 	success = true
-	return dbp.Continue()
+	return grp.Continue()
 }
 
 // StepInstruction will continue the current thread for exactly
 // one instruction. This method affects only the thread
 // associated with the selected goroutine. All other
 // threads will remain stopped.
-func (dbp *Target) StepInstruction() (err error) {
+func (grp *TargetGroup) StepInstruction() (err error) {
+	dbp := grp.Selected
 	thread := dbp.CurrentThread()
 	g := dbp.SelectedGoroutine()
 	if g != nil {
@@ -405,7 +420,7 @@ func (dbp *Target) StepInstruction() (err error) {
 				sameGoroutineCondition(dbp.SelectedGoroutine())); err != nil {
 				return err
 			}
-			return dbp.Continue()
+			return grp.Continue()
 		}
 		thread = g.Thread
 	}
@@ -418,7 +433,7 @@ func (dbp *Target) StepInstruction() (err error) {
 		return err
 	}
 	thread.Breakpoint().Clear()
-	err = thread.SetCurrentBreakpoint(true)
+	err = thread.SetCurrentBreakpoint(false)
 	if err != nil {
 		return err
 	}
@@ -438,14 +453,14 @@ func (dbp *Target) StepInstruction() (err error) {
 // once the CALL is reached.
 //
 // Regardless of stepInto the following breakpoints will be set:
-// - a breakpoint on the first deferred function with NextDeferBreakpoint
-//   kind, the list of all the addresses to deferreturn calls in this function
-//   and condition checking that we remain on the same goroutine
-// - a breakpoint on each line of the function, with a condition checking
-//   that we stay on the same stack frame and goroutine.
-// - a breakpoint on the return address of the function, with a condition
-//   checking that we move to the previous stack frame and stay on the same
-//   goroutine.
+//   - a breakpoint on the first deferred function with NextDeferBreakpoint
+//     kind, the list of all the addresses to deferreturn calls in this function
+//     and condition checking that we remain on the same goroutine
+//   - a breakpoint on each line of the function, with a condition checking
+//     that we stay on the same stack frame and goroutine.
+//   - a breakpoint on the return address of the function, with a condition
+//     checking that we move to the previous stack frame and stay on the same
+//     goroutine.
 //
 // The breakpoint on the return address is *not* set if the current frame is
 // an inlined call. For inlined calls topframe.Current.Fn is the function
@@ -457,7 +472,7 @@ func (dbp *Target) StepInstruction() (err error) {
 // when removing instructions belonging to inlined calls we also remove all
 // instructions belonging to the current inlined call.
 func next(dbp *Target, stepInto, inlinedStepOut bool) error {
-	backward := dbp.GetDirection() == Backward
+	backward := dbp.recman.GetDirection() == Backward
 	selg := dbp.SelectedGoroutine()
 	curthread := dbp.CurrentThread()
 	topframe, retframe, err := topframe(selg, curthread)
@@ -791,7 +806,7 @@ func isAutogeneratedOrDeferReturn(loc Location) bool {
 	return isAutogenerated(loc) || (loc.Fn != nil && loc.Fn.Name == "runtime.deferreturn")
 }
 
-// skipAutogeneratedWrappers skips autogenerated wrappers when setting a
+// skipAutogeneratedWrappersIn skips autogenerated wrappers when setting a
 // step-into breakpoint.
 // See genwrapper in: $GOROOT/src/cmd/compile/internal/gc/subr.go
 func skipAutogeneratedWrappersIn(p Process, startfn *Function, startpc uint64) (*Function, uint64) {
@@ -950,12 +965,13 @@ func findCallInstrForRet(p Process, mem MemoryReadWriter, ret uint64, fn *Functi
 }
 
 // stepOutReverse sets a breakpoint on the CALL instruction that created the current frame, this is either:
-// - the CALL instruction immediately preceding the return address of the
-//   current frame
-// - the return address of the current frame if the current frame was
-//   created by a runtime.deferreturn run
-// - the return address of the runtime.gopanic frame if the current frame
-//   was created by a panic
+//   - the CALL instruction immediately preceding the return address of the
+//     current frame
+//   - the return address of the current frame if the current frame was
+//     created by a runtime.deferreturn run
+//   - the return address of the runtime.gopanic frame if the current frame
+//     was created by a panic
+//
 // This function is used to implement reversed StepOut
 func stepOutReverse(p *Target, topframe, retframe Stackframe, sameGCond ast.Expr) error {
 	curthread := p.CurrentThread()
@@ -1078,7 +1094,7 @@ func (tgt *Target) clearHardcodedBreakpoints() {
 func (tgt *Target) handleHardcodedBreakpoints(trapthread Thread, threads []Thread) error {
 	mem := tgt.Memory()
 	arch := tgt.BinInfo().Arch
-	recorded, _ := tgt.Recorded()
+	recorded, _ := tgt.recman.Recorded()
 
 	isHardcodedBreakpoint := func(thread Thread, pc uint64) uint64 {
 		for _, bpinstr := range [][]byte{arch.BreakpointInstruction(), arch.AltBreakpointInstruction()} {
@@ -1119,7 +1135,8 @@ func (tgt *Target) handleHardcodedBreakpoints(trapthread Thread, threads []Threa
 		hcbp.File = loc.File
 		hcbp.Line = loc.Line
 		hcbp.Addr = loc.PC
-		hcbp.Name = HardcodedBreakpoint
+		hcbp.Logical = &LogicalBreakpoint{}
+		hcbp.Logical.Name = HardcodedBreakpoint
 		hcbp.Breaklets = []*Breaklet{&Breaklet{Kind: UserBreakpoint, LogicalID: hardcodedBreakpointID}}
 		tgt.StopReason = StopHardcodedBreakpoint
 	}
@@ -1141,7 +1158,7 @@ func (tgt *Target) handleHardcodedBreakpoints(trapthread Thread, threads []Threa
 
 		switch {
 		case loc.Fn.Name == "runtime.breakpoint":
-			if recorded, _ := tgt.Recorded(); recorded {
+			if recorded, _ := tgt.recman.Recorded(); recorded {
 				setHardcodedBreakpoint(thread, loc)
 				continue
 			}

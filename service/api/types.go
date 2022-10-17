@@ -57,7 +57,8 @@ type TracepointResult struct {
 	// File is the source file for the breakpoint.
 	File string `json:"file"`
 	// Line is a line in File for the breakpoint.
-	Line int `json:"line"`
+	Line  int  `json:"line"`
+	IsRet bool `json:"is_ret"`
 	// FunctionName is the name of the function at the current breakpoint, and
 	// may not always be available.
 	FunctionName string `json:"functionName,omitempty"`
@@ -79,6 +80,9 @@ type Breakpoint struct {
 	Addr uint64 `json:"addr"`
 	// Addrs is the list of addresses for this breakpoint.
 	Addrs []uint64 `json:"addrs"`
+	// AddrPid[i] is the PID associated with by Addrs[i], when debugging a
+	// single target process this is optional, otherwise it is mandatory.
+	AddrPid []int `json:"addrpid"`
 	// File is the source file for the breakpoint.
 	File string `json:"file"`
 	// Line is a line in File for the breakpoint.
@@ -92,6 +96,8 @@ type Breakpoint struct {
 	// Breakpoint hit count condition.
 	// Supported hit count conditions are "NUMBER" and "OP NUMBER".
 	HitCond string
+	// HitCondPerG use per goroutine hitcount as HitCond operand, instead of total hitcount
+	HitCondPerG bool
 
 	// Tracepoint flag, signifying this is a tracepoint.
 	Tracepoint bool `json:"continue"`
@@ -165,7 +171,7 @@ type Thread struct {
 	Function *Function `json:"function,omitempty"`
 
 	// ID of the goroutine running on this thread
-	GoroutineID int `json:"goroutineID"`
+	GoroutineID int64 `json:"goroutineID"`
 
 	// Breakpoint this thread is stopped at
 	Breakpoint *Breakpoint `json:"breakPoint,omitempty"`
@@ -189,6 +195,7 @@ type Location struct {
 	Line     int       `json:"line"`
 	Function *Function `json:"function,omitempty"`
 	PCs      []uint64  `json:"pcs,omitempty"`
+	PCPids   []int     `json:"pcpids,omitempty"`
 }
 
 // Stackframe describes one frame in a stack trace.
@@ -355,7 +362,7 @@ type LoadConfig struct {
 // internal G structure.
 type Goroutine struct {
 	// ID is a unique identifier for the goroutine.
-	ID int `json:"id"`
+	ID int64 `json:"id"`
 	// Current location of the goroutine
 	CurrentLoc Location `json:"currentLoc"`
 	// Current location of the goroutine, excluding calls inside runtime
@@ -388,7 +395,7 @@ type DebuggerCommand struct {
 	ThreadID int `json:"threadID,omitempty"`
 	// GoroutineID is used to specify which thread to use with the SwitchGoroutine
 	// and Call commands.
-	GoroutineID int `json:"goroutineID,omitempty"`
+	GoroutineID int64 `json:"goroutineID,omitempty"`
 	// When ReturnInfoLoadConfig is not nil it will be used to load the value
 	// of any return variables.
 	ReturnInfoLoadConfig *LoadConfig
@@ -423,7 +430,7 @@ type BreakpointInfo struct {
 // EvalScope is the scope a command should
 // be evaluated in. Describes the goroutine and frame number.
 type EvalScope struct {
-	GoroutineID  int
+	GoroutineID  int64
 	Frame        int
 	DeferredCall int // when DeferredCall is n > 0 this eval scope is relative to the n-th deferred call in the current frame
 }

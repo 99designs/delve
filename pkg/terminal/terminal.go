@@ -3,7 +3,6 @@ package terminal
 //lint:file-ignore ST1005 errors here can be capitalized
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/rpc"
@@ -75,6 +74,8 @@ type Term struct {
 
 	quittingMutex sync.Mutex
 	quitting      bool
+
+	traceNonInteractive bool
 }
 
 type displayEntry struct {
@@ -99,12 +100,12 @@ func New(client service.Client, conf *config.Config) *Term {
 		prompt: "(dlv) ",
 		line:   liner.NewLiner(),
 		cmds:   cmds,
-		stdout: &transcriptWriter{w: os.Stdout},
+		stdout: &transcriptWriter{pw: &pagingWriter{w: os.Stdout}},
 	}
 	t.line.SetCtrlZStop(true)
 
 	if strings.ToLower(os.Getenv("TERM")) != "dumb" {
-		t.stdout.w = getColorableWriter()
+		t.stdout.pw = &pagingWriter{w: getColorableWriter()}
 		t.stdout.colorEscapes = make(map[colorize.Style]string)
 		t.stdout.colorEscapes[colorize.NormalStyle] = terminalResetEscapeCode
 		wd := func(s string, defaultCode int) string {
@@ -138,6 +139,14 @@ func New(client service.Client, conf *config.Config) *Term {
 
 	t.starlarkEnv = starbind.New(starlarkContext{t}, t.stdout)
 	return t
+}
+
+func (t *Term) SetTraceNonInteractive() {
+	t.traceNonInteractive = true
+}
+
+func (t *Term) IsTraceNonInteractive() bool {
+	return t.traceNonInteractive
 }
 
 // Close returns the terminal to its previous mode.
@@ -229,6 +238,8 @@ func (t *Term) Run() (int, error) {
 		}
 	}
 
+	var locs *trie.Trie
+
 	t.line.SetCompleter(func(line string) (c []string) {
 		cmd := t.cmds.Find(strings.Split(line, " ")[0], noPrefix)
 		switch cmd.aliases[0] {
@@ -243,6 +254,30 @@ func (t *Term) Run() (int, error) {
 		case "nullcmd", "nocmd":
 			commands := cmds.FuzzySearch(strings.ToLower(line))
 			c = append(c, commands...)
+		case "print", "whatis":
+			if locs == nil {
+				localVars, err := t.client.ListLocalVariables(
+					api.EvalScope{GoroutineID: -1, Frame: t.cmds.frame, DeferredCall: 0},
+					api.LoadConfig{},
+				)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Unable to get local variables: %s\n", err)
+					break
+				}
+
+				locs = trie.New()
+				for _, loc := range localVars {
+					locs.Add(loc.Name, nil)
+				}
+			}
+
+			if spc := strings.LastIndex(line, " "); spc > 0 {
+				prefix := line[:spc] + " "
+				locals := locs.FuzzySearch(line[spc+1:])
+				for _, l := range locals {
+					c = append(c, prefix+l)
+				}
+			}
 		}
 		return
 	})
@@ -279,6 +314,8 @@ func (t *Term) Run() (int, error) {
 	_, _ = t.client.GetState()
 
 	for {
+		locs = nil
+
 		cmdstr, err := t.promptForInput()
 		if err != nil {
 			if err == io.EOF {
@@ -316,6 +353,7 @@ func (t *Term) Run() (int, error) {
 		}
 
 		t.stdout.Flush()
+		t.stdout.pw.Reset()
 	}
 }
 
@@ -460,7 +498,7 @@ func (t *Term) handleExit() (int, error) {
 	return 0, nil
 }
 
-// loadConfig returns an api.LoadConfig with the parameterss specified in
+// loadConfig returns an api.LoadConfig with the parameters specified in
 // the configuration file.
 func (t *Term) loadConfig() api.LoadConfig {
 	r := api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
@@ -542,88 +580,11 @@ func (t *Term) longCommandCanceled() bool {
 
 // RedirectTo redirects the output of this terminal to the specified writer.
 func (t *Term) RedirectTo(w io.Writer) {
-	t.stdout.w = w
+	t.stdout.pw.w = w
 }
 
 // isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited
 func isErrProcessExited(err error) bool {
 	rpcError, ok := err.(rpc.ServerError)
 	return ok && strings.Contains(rpcError.Error(), "has exited with status")
-}
-
-// transcriptWriter writes to a io.Writer and also, optionally, to a
-// buffered file.
-type transcriptWriter struct {
-	fileOnly     bool
-	w            io.Writer
-	file         *bufio.Writer
-	fh           io.Closer
-	colorEscapes map[colorize.Style]string
-}
-
-func (w *transcriptWriter) Write(p []byte) (nn int, err error) {
-	if !w.fileOnly {
-		nn, err = w.w.Write(p)
-	}
-	if err == nil {
-		if w.file != nil {
-			return w.file.Write(p)
-		}
-	}
-	return
-}
-
-// ColorizePrint prints to out a syntax highlighted version of the text read from
-// reader, between lines startLine and endLine.
-func (w *transcriptWriter) ColorizePrint(path string, reader io.ReadSeeker, startLine, endLine, arrowLine int) error {
-	var err error
-	if !w.fileOnly {
-		err = colorize.Print(w.w, path, reader, startLine, endLine, arrowLine, w.colorEscapes)
-	}
-	if err == nil {
-		if w.file != nil {
-			reader.Seek(0, io.SeekStart)
-			return colorize.Print(w.file, path, reader, startLine, endLine, arrowLine, nil)
-		}
-	}
-	return err
-}
-
-// Echo outputs str only to the optional transcript file.
-func (w *transcriptWriter) Echo(str string) {
-	if w.file != nil {
-		w.file.WriteString(str)
-	}
-}
-
-// Flush flushes the optional transcript file.
-func (w *transcriptWriter) Flush() {
-	if w.file != nil {
-		w.file.Flush()
-	}
-}
-
-// CloseTranscript closes the optional transcript file.
-func (w *transcriptWriter) CloseTranscript() error {
-	if w.file == nil {
-		return nil
-	}
-	w.file.Flush()
-	w.fileOnly = false
-	err := w.fh.Close()
-	w.file = nil
-	w.fh = nil
-	return err
-}
-
-// TranscribeTo starts transcribing the output to the specified file. If
-// fileOnly is true the output will only go to the file, output to the
-// io.Writer will be suppressed.
-func (w *transcriptWriter) TranscribeTo(fh io.WriteCloser, fileOnly bool) {
-	if w.file == nil {
-		w.CloseTranscript()
-	}
-	w.fh = fh
-	w.file = bufio.NewWriter(fh)
-	w.fileOnly = fileOnly
 }

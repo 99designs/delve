@@ -31,7 +31,7 @@ if [ "$version" = "gotip" ]; then
 	cd -
 else
 	echo Finding latest patch version for $version
-	version=$(curl 'https://go.dev/dl/?mode=json&include=all' | jq '.[].version' --raw-output | egrep ^$version'($|\.|beta|rc)' | sort -rV | head -1)
+	version=$(curl 'https://go.dev/dl/?mode=json&include=all' | jq '.[].version' --raw-output | egrep ^$version'($|\.|^beta|^rc)' | sort -rV | head -1)
 	echo "Go $version on $arch"
 	getgo $version
 fi
@@ -41,7 +41,7 @@ GOPATH=$(pwd)/go
 export GOPATH
 export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
 go version
-go install honnef.co/go/tools/cmd/staticcheck@2021.1.1 || true
+go install honnef.co/go/tools/cmd/staticcheck@2022.1.2 || true
 
 uname -a
 echo "$PATH"
@@ -57,4 +57,19 @@ elif [ ${version:4:2} -gt 17 ]; then
 	export GOFLAGS=-buildvcs=false
 fi
 
+if [ "$arch" = "386" ]; then
+	ver=$(go version)
+	if [ "$ver" = "go version go1.19 linux/386" ]; then
+		export CGO_CFLAGS='-g -O0 -fno-stack-protector'
+	fi
+fi
+
+set +e
 make test
+x=$?
+if [ "$version" = "gotip" ]; then
+	exit 0
+else
+	exit $x
+fi
+

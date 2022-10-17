@@ -54,7 +54,7 @@ const logCommandOutput = false
 
 func (ft *FakeTerminal) Exec(cmdstr string) (outstr string, err error) {
 	var buf bytes.Buffer
-	ft.Term.stdout.w = &buf
+	ft.Term.stdout.pw.w = &buf
 	ft.Term.starlarkEnv.Redirect(ft.Term.stdout)
 	err = ft.cmds.Call(cmdstr, ft.Term)
 	outstr = buf.String()
@@ -67,7 +67,7 @@ func (ft *FakeTerminal) Exec(cmdstr string) (outstr string, err error) {
 
 func (ft *FakeTerminal) ExecStarlark(starlarkProgram string) (outstr string, err error) {
 	var buf bytes.Buffer
-	ft.Term.stdout.w = &buf
+	ft.Term.stdout.pw.w = &buf
 	ft.Term.starlarkEnv.Redirect(ft.Term.stdout)
 	_, err = ft.Term.starlarkEnv.Execute("<stdin>", starlarkProgram, "main", nil)
 	outstr = buf.String()
@@ -1158,6 +1158,26 @@ func TestHitCondBreakpoint(t *testing.T) {
 			t.Fatalf("wrong value of i")
 		}
 	})
+
+	withTestTerminal("condperghitcount", t, func(term *FakeTerminal) {
+		term.MustExec("break bp1 main.main:8")
+		term.MustExec("condition -per-g-hitcount bp1 == 2")
+		listIsAt(t, term, "continue", 16, -1, -1)
+		// first g hit
+		out := term.MustExec("print j")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "2\n") {
+			t.Fatalf("wrong value of j")
+		}
+		term.MustExec("toggle bp1")
+		listIsAt(t, term, "continue", 16, -1, -1)
+		// second g hit
+		out = term.MustExec("print j")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "2\n") {
+			t.Fatalf("wrong value of j")
+		}
+	})
 }
 
 func TestClearCondBreakpoint(t *testing.T) {
@@ -1309,5 +1329,16 @@ func TestTranscript(t *testing.T) {
 		}
 
 		os.Remove(name)
+	})
+}
+
+func TestDisassPosCmd(t *testing.T) {
+	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
+		term.MustExec("continue")
+		out := term.MustExec("step-instruction")
+		t.Logf("%q\n", out)
+		if !strings.Contains(out, "call $runtime.Breakpoint") && !strings.Contains(out, "CALL runtime.Breakpoint(SB)") {
+			t.Errorf("output doesn't look like disassembly")
+		}
 	})
 }
