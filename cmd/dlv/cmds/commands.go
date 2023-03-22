@@ -91,6 +91,8 @@ var (
 
 	conf        *config.Config
 	loadConfErr error
+
+	rrOnProcessPid int
 )
 
 const dlvCommandLongDesc = `Delve is a source level debugger for Go programs.
@@ -278,7 +280,7 @@ unit tests. By default Delve will debug the tests in the current directory.
 Alternatively you can specify a package name, and Delve will debug the tests in
 that package instead. Double-dashes ` + "`--`" + ` can be used to pass arguments to the test program:
 
-dlv test [package] -- -test.v -other-argument
+dlv test [package] -- -test.run TestSomething -test.v -other-argument
 
 See also: 'go help testflag'.`,
 		Run: testCmd,
@@ -327,6 +329,10 @@ Currently supports linux/amd64 and linux/arm64 core files, windows/amd64 minidum
 		},
 		Run: coreCmd,
 	}
+	// -c is unused and exists so delve can be used with coredumpctl
+	core := false
+	coreCommand.Flags().BoolVarP(&core, "core", "c", false, "")
+	coreCommand.Flags().MarkHidden("core")
 	rootCommand.AddCommand(coreCommand)
 
 	// 'version' subcommand.
@@ -364,6 +370,10 @@ https://github.com/mozilla/rr
 				os.Exit(execute(0, []string{}, conf, args[0], debugger.ExecutingOther, args, buildFlags))
 			},
 		}
+
+		replayCommand.Flags().IntVarP(&rrOnProcessPid, "onprocess", "p", 0,
+			"Pass onprocess pid to rr.")
+
 		rootCommand.AddCommand(replayCommand)
 	}
 
@@ -728,7 +738,9 @@ func traceCmd(cmd *cobra.Command, args []string) {
 		err = cmds.Call("continue", t)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			return 1
+			if !strings.Contains(err.Error(), "exited") {
+				return 1
+			}
 		}
 		return 0
 	}()
@@ -750,11 +762,7 @@ func testCmd(cmd *cobra.Command, args []string) {
 		processArgs := append([]string{debugname}, targetArgs...)
 
 		if workingDir == "" {
-			if len(dlvArgs) == 1 {
-				workingDir = getPackageDir(dlvArgs[0])
-			} else {
-				workingDir = "."
-			}
+			workingDir = getPackageDir(dlvArgs)
 		}
 
 		return execute(0, processArgs, conf, "", debugger.ExecutingGeneratedTest, dlvArgs, buildFlags)
@@ -762,8 +770,10 @@ func testCmd(cmd *cobra.Command, args []string) {
 	os.Exit(status)
 }
 
-func getPackageDir(pkg string) string {
-	out, err := exec.Command("go", "list", "--json", pkg).CombinedOutput()
+func getPackageDir(pkg []string) string {
+	args := []string{"list", "--json"}
+	args = append(args, pkg...)
+	out, err := exec.Command("go", args...).CombinedOutput()
 	if err != nil {
 		return "."
 	}
@@ -977,6 +987,7 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 				TTY:                  tty,
 				Redirects:            redirects,
 				DisableASLR:          disableASLR,
+				RrOnProcessPid:       rrOnProcessPid,
 			},
 		})
 	default:

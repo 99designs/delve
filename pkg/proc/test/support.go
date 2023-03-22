@@ -195,7 +195,7 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 	source = filepath.ToSlash(source)
 	sympath, err := filepath.EvalSymlinks(source)
 	if err == nil {
-		source = strings.Replace(sympath, "\\", "/", -1)
+		source = strings.ReplaceAll(sympath, "\\", "/")
 	}
 
 	absdir, _ := filepath.Abs(dir)
@@ -341,7 +341,7 @@ func MustSupportFunctionCalls(t *testing.T, testBackend string) {
 		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
 	}
 	if runtime.GOARCH == "arm64" {
-		if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 19) {
+		if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 19) || runtime.GOOS == "windows" {
 			t.Skip("this version of Go does not support function calls")
 		}
 	}

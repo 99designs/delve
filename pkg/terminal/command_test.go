@@ -79,6 +79,7 @@ func (ft *FakeTerminal) ExecStarlark(starlarkProgram string) (outstr string, err
 }
 
 func (ft *FakeTerminal) MustExec(cmdstr string) string {
+	ft.t.Helper()
 	outstr, err := ft.Exec(cmdstr)
 	if err != nil {
 		ft.t.Errorf("output of %q: %q", cmdstr, outstr)
@@ -456,9 +457,6 @@ func TestScopePrefix(t *testing.T) {
 }
 
 func TestOnPrefix(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
 	const prefix = "\ti: "
 	test.AllowRecording(t)
 	lenient := false
@@ -520,9 +518,6 @@ func TestNoVars(t *testing.T) {
 }
 
 func TestOnPrefixLocals(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
 	const prefix = "\ti: "
 	test.AllowRecording(t)
 	withTestTerminal("goroutinestackprog", t, func(term *FakeTerminal) {
@@ -562,19 +557,6 @@ func TestOnPrefixLocals(t *testing.T) {
 			}
 		}
 	})
-}
-
-func countOccurrences(s, needle string) int {
-	count := 0
-	for {
-		idx := strings.Index(s, needle)
-		if idx < 0 {
-			break
-		}
-		count++
-		s = s[idx+len(needle):]
-	}
-	return count
 }
 
 func listIsAt(t *testing.T, term *FakeTerminal, listcmd string, cur, start, end int) {
@@ -1339,6 +1321,20 @@ func TestDisassPosCmd(t *testing.T) {
 		t.Logf("%q\n", out)
 		if !strings.Contains(out, "call $runtime.Breakpoint") && !strings.Contains(out, "CALL runtime.Breakpoint(SB)") {
 			t.Errorf("output doesn't look like disassembly")
+		}
+	})
+}
+
+func TestCreateBreakpointByLocExpr(t *testing.T) {
+	withTestTerminal("math", t, func(term *FakeTerminal) {
+		out := term.MustExec("break main.main")
+		position1 := strings.Split(out, " set at ")[1]
+		term.MustExec("continue")
+		term.MustExec("clear 1")
+		out = term.MustExec("break +0")
+		position2 := strings.Split(out, " set at ")[1]
+		if position1 != position2 {
+			t.Fatalf("mismatched positions %q and %q\n", position1, position2)
 		}
 	})
 }

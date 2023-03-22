@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/logflags"
+	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
 	"github.com/go-delve/delve/service/rpc2"
@@ -996,7 +997,7 @@ func TestClientServer_FindLocations(t *testing.T) {
 		if strings.Contains(locsNoSubst[0].File, "\\") {
 			sep = "\\"
 		}
-		substRules := [][2]string{[2]string{strings.Replace(locsNoSubst[0].File, "locationsprog.go", "", 1), strings.Replace(locsNoSubst[0].File, "_fixtures"+sep+"locationsprog.go", "nonexistent", 1)}}
+		substRules := [][2]string{{strings.Replace(locsNoSubst[0].File, "locationsprog.go", "", 1), strings.Replace(locsNoSubst[0].File, "_fixtures"+sep+"locationsprog.go", "nonexistent", 1)}}
 		t.Logf("substitute rules: %q -> %q", substRules[0][0], substRules[0][1])
 		locsSubst, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "nonexistent/locationsprog.go:35", false, substRules)
 		if err != nil {
@@ -1305,7 +1306,7 @@ func TestIssue355(t *testing.T) {
 	// After the target process has terminated should return an error but not crash
 	protest.AllowRecording(t)
 	withTestClient2("continuetestprog", t, func(c service.Client) {
-		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
 		ch := c.Continue()
 		state := <-ch
@@ -1334,14 +1335,6 @@ func TestIssue355(t *testing.T) {
 		assertErrorOrExited(s, err, t, "SwitchGoroutine()")
 		s, err = c.Halt()
 		assertErrorOrExited(s, err, t, "Halt()")
-		_, err = c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -1})
-		if testBackend != "rr" {
-			assertError(err, t, "CreateBreakpoint()")
-		}
-		_, err = c.ClearBreakpoint(bp.ID)
-		if testBackend != "rr" {
-			assertError(err, t, "ClearBreakpoint()")
-		}
 		_, err = c.ListThreads()
 		assertError(err, t, "ListThreads()")
 		_, err = c.GetThread(tid)
@@ -1496,9 +1489,6 @@ func TestNegativeStackDepthBug(t *testing.T) {
 }
 
 func TestClientServer_CondBreakpoint(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
 	protest.AllowRecording(t)
 	withTestClient2("parallel_next", t, func(c service.Client) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: 1})
@@ -2011,19 +2001,6 @@ func TestClientServer_StepOutReturn(t *testing.T) {
 		stridx := 0
 		numidx := 1
 
-		if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 12) {
-			// in 1.11 and earlier the order of return values in DWARF is
-			// unspecified, in 1.11 and later it follows the order of definition
-			// specified by the user
-			for i := range ret {
-				if ret[i].Name == "str" {
-					stridx = i
-					numidx = 1 - i
-					break
-				}
-			}
-		}
-
 		if ret[stridx].Name != "str" {
 			t.Fatalf("(str) bad return value name %s", ret[stridx].Name)
 		}
@@ -2146,32 +2123,6 @@ func TestClientServerFunctionCall(t *testing.T) {
 		state = <-c.Continue()
 		if !state.Exited {
 			t.Fatalf("expected process to exit after call %v", state.CurrentThread)
-		}
-	})
-}
-
-func TestClientServerFunctionCallBadPos(t *testing.T) {
-	protest.MustSupportFunctionCalls(t, testBackend)
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 12) {
-		t.Skip("this is a safe point for Go 1.12")
-	}
-	withTestClient2("fncall", t, func(c service.Client) {
-		loc, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "fmt/print.go:649", false, nil)
-		assertNoError(err, t, "could not find location")
-
-		_, err = c.CreateBreakpoint(&api.Breakpoint{File: loc[0].File, Line: loc[0].Line})
-		assertNoError(err, t, "CreateBreakpoin")
-
-		state := <-c.Continue()
-		assertNoError(state.Err, t, "Continue()")
-
-		state = <-c.Continue()
-		assertNoError(state.Err, t, "Continue()")
-
-		c.SetReturnValuesLoadConfig(&normalLoadConfig)
-		state, err = c.Call(-1, "main.call1(main.zero, main.zero)", false)
-		if err == nil || err.Error() != "call not at safe point" {
-			t.Fatalf("wrong error or no error: %v", err)
 		}
 	})
 }
@@ -2959,5 +2910,84 @@ func TestPluginSuspendedBreakpoint(t *testing.T) {
 		cont("Continue 2", "plugintest.go", 27)
 		cont("Continue 3", "plugin1.go", 5)
 		cont("Continue 4", "plugin2.go", 9)
+	})
+}
+
+// Tests that breakpoint set after the process has exited will be hit when the process is restarted.
+func TestBreakpointAfterProcessExit(t *testing.T) {
+	withTestClient2("continuetestprog", t, func(c service.Client) {
+		state := <-c.Continue()
+		if !state.Exited {
+			t.Fatal("process should have exited")
+		}
+		bp, err := c.CreateBreakpointWithExpr(&api.Breakpoint{ID: 2, FunctionName: "main.main", Line: 1}, "main.main", nil, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Restart(false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state = <-c.Continue()
+		if state.CurrentThread == nil {
+			t.Fatal("no current thread")
+		}
+		if state.CurrentThread.Breakpoint == nil {
+			t.Fatal("no breakpoint")
+		}
+		if state.CurrentThread.Breakpoint.ID != bp.ID {
+			t.Fatal("did not hit correct breakpoint")
+		}
+		if state.CurrentThread.Function == nil {
+			t.Fatal("no function")
+		}
+		if state.CurrentThread.Function.Name() != "main.main" {
+			t.Fatal("stopped at incorrect function")
+		}
+		state = <-c.Continue()
+		if !state.Exited {
+			t.Fatal("process should have exited")
+		}
+		_, err = c.ClearBreakpoint(bp.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestClientServer_createBreakpointWithID(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestClient2("continuetestprog", t, func(c service.Client) {
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{ID: 2, FunctionName: "main.main", Line: 1})
+		assertNoError(err, t, "CreateBreakpoint()")
+		if bp.ID != 2 {
+			t.Errorf("wrong ID for breakpoint %d", bp.ID)
+		}
+
+		bp2, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: 2})
+		assertNoError(err, t, "CreateBreakpoint()")
+		if bp2.ID != 3 {
+			t.Errorf("wrong ID for breakpoint %d", bp2.ID)
+		}
+	})
+}
+
+func TestClientServer_autoBreakpoints(t *testing.T) {
+	// Check that unrecoverd-panic and fatal-throw breakpoints are visible in
+	// the breakpoint list.
+	protest.AllowRecording(t)
+	withTestClient2("math", t, func(c service.Client) {
+		bps, err := c.ListBreakpoints(false)
+		assertNoError(err, t, "ListBreakpoints")
+		n := 0
+		for _, bp := range bps {
+			t.Log(bp)
+			if bp.Name == proc.UnrecoveredPanic || bp.Name == proc.FatalThrow {
+				n++
+			}
+		}
+		if n != 2 {
+			t.Error("automatic breakpoints not found")
+		}
 	})
 }

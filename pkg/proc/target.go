@@ -38,9 +38,8 @@ const (
 type Target struct {
 	Process
 
-	proc         ProcessInternal
-	recman       RecordingManipulationInternal
-	continueOnce ContinueOnceFunc
+	proc   ProcessInternal
+	recman RecordingManipulationInternal
 
 	pid int
 
@@ -48,9 +47,6 @@ type Target struct {
 	// A process could be stopped for multiple simultaneous reasons, in which
 	// case only one will be reported.
 	StopReason StopReason
-
-	// CanDump is true if core dumping is supported.
-	CanDump bool
 
 	// currentThread is the thread that will be used by next/step/stepout and to evaluate variables if no goroutine is selected.
 	currentThread Thread
@@ -148,18 +144,6 @@ const (
 	StopWatchpoint                     // The target process hit one or more watchpoints
 )
 
-type ContinueOnceFunc func([]ProcessInternal, *ContinueOnceContext) (trapthread Thread, stopReason StopReason, err error)
-
-// NewTargetConfig contains the configuration for a new Target object,
-type NewTargetConfig struct {
-	Path                string     // path of the main executable
-	DebugInfoDirs       []string   // Directories to search for split debug info
-	DisableAsyncPreempt bool       // Go 1.14 asynchronous preemption should be disabled
-	StopReason          StopReason // Initial stop reason
-	CanDump             bool       // Can create core dumps (must implement ProcessInternal.MemoryMap)
-	ContinueOnce        ContinueOnceFunc
-}
-
 // DisableAsyncPreemptEnv returns a process environment (like os.Environ)
 // where asyncpreemptoff is set to 1.
 func DisableAsyncPreemptEnv() []string {
@@ -174,15 +158,15 @@ func DisableAsyncPreemptEnv() []string {
 	return env
 }
 
-// NewTarget returns an initialized Target object.
+// newTarget returns an initialized Target object.
 // The p argument can optionally implement the RecordingManipulation interface.
-func NewTarget(p ProcessInternal, pid int, currentThread Thread, cfg NewTargetConfig) (*Target, error) {
+func (grp *TargetGroup) newTarget(p ProcessInternal, pid int, currentThread Thread, path string) (*Target, error) {
 	entryPoint, err := p.EntryPoint()
 	if err != nil {
 		return nil, err
 	}
 
-	err = p.BinInfo().LoadBinaryInfo(cfg.Path, entryPoint, cfg.DebugInfoDirs)
+	err = p.BinInfo().LoadBinaryInfo(path, entryPoint, grp.cfg.DebugInfoDirs)
 	if err != nil {
 		return nil, err
 	}
@@ -196,11 +180,8 @@ func NewTarget(p ProcessInternal, pid int, currentThread Thread, cfg NewTargetCo
 		Process:       p,
 		proc:          p,
 		fncallForG:    make(map[int64]*callInjection),
-		StopReason:    cfg.StopReason,
 		currentThread: currentThread,
-		CanDump:       cfg.CanDump,
 		pid:           pid,
-		continueOnce:  cfg.ContinueOnce,
 	}
 
 	if recman, ok := p.(RecordingManipulationInternal); ok {
@@ -212,6 +193,7 @@ func NewTarget(p ProcessInternal, pid int, currentThread Thread, cfg NewTargetCo
 	g, _ := GetG(currentThread)
 	t.selectedGoroutine = g
 
+	t.Breakpoints().Logical = grp.LogicalBreakpoints
 	t.createUnrecoveredPanicBreakpoint()
 	t.createFatalThrowBreakpoint()
 	t.createPluginOpenBreakpoint()
@@ -219,7 +201,7 @@ func NewTarget(p ProcessInternal, pid int, currentThread Thread, cfg NewTargetCo
 	t.gcache.init(p.BinInfo())
 	t.fakeMemoryRegistryMap = make(map[string]*compositeMemory)
 
-	if cfg.DisableAsyncPreempt {
+	if grp.cfg.DisableAsyncPreempt {
 		setAsyncPreemptOff(t, 1)
 	}
 
@@ -268,7 +250,7 @@ func (t *Target) Valid() (bool, error) {
 // Currently only non-recorded processes running on AMD64 support
 // function calls.
 func (t *Target) SupportsFunctionCalls() bool {
-	return t.Process.BinInfo().Arch.Name == "amd64" || t.Process.BinInfo().Arch.Name == "arm64"
+	return t.Process.BinInfo().Arch.Name == "amd64" || (t.Process.BinInfo().Arch.Name == "arm64" && t.Process.BinInfo().GOOS != "windows")
 }
 
 // ClearCaches clears internal caches that should not survive a restart.
@@ -339,7 +321,7 @@ func (p *Target) SwitchThread(tid int) error {
 	return fmt.Errorf("thread %d does not exist", tid)
 }
 
-// detach will detach the target from the underylying process.
+// detach will detach the target from the underlying process.
 // This means the debugger will no longer receive events from the process
 // we were previously debugging.
 // If kill is true then the process will be killed when we detach.

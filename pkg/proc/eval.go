@@ -739,9 +739,14 @@ func (scope *EvalScope) evalTypeCastOrFuncCall(node *ast.CallExpr) (*Variable, e
 		return v, err
 	}
 
-	fnnode := removeParen(node.Fun)
-	if n, _ := fnnode.(*ast.StarExpr); n != nil {
-		fnnode = removeParen(n.X)
+	fnnode := node.Fun
+	for {
+		fnnode = removeParen(fnnode)
+		n, _ := fnnode.(*ast.StarExpr)
+		if n == nil {
+			break
+		}
+		fnnode = n.X
 	}
 
 	switch n := fnnode.(type) {
@@ -811,6 +816,11 @@ func (scope *EvalScope) evalTypeCast(node *ast.CallExpr) (*Variable, error) {
 
 	// compatible underlying types
 	if typeCastCompatibleTypes(argv.RealType, typ) {
+		if ptyp, isptr := typ.(*godwarf.PtrType); argv.Kind == reflect.Ptr && argv.loaded && len(argv.Children) > 0 && isptr {
+			cv := argv.Children[0]
+			argv.Children[0] = *newVariable(cv.Name, cv.Addr, ptyp.Type, cv.bi, cv.mem)
+			argv.Children[0].OnlyAddr = true
+		}
 		argv.RealType = typ
 		argv.DwarfType = styp
 		return argv, nil
@@ -1028,6 +1038,11 @@ func typeCastCompatibleTypes(typ1, typ2 godwarf.Type) bool {
 	switch ttyp1 := typ1.(type) {
 	case *godwarf.PtrType:
 		if ttyp2, ok := typ2.(*godwarf.PtrType); ok {
+			_, isvoid1 := ttyp1.Type.(*godwarf.VoidType)
+			_, isvoid2 := ttyp2.Type.(*godwarf.VoidType)
+			if isvoid1 || isvoid2 {
+				return true
+			}
 			// pointer types are compatible if their element types are compatible
 			return typeCastCompatibleTypes(resolveTypedef(ttyp1.Type), resolveTypedef(ttyp2.Type))
 		}
@@ -1556,7 +1571,14 @@ func (scope *EvalScope) evalPointerDeref(node *ast.StarExpr) (*Variable, error) 
 		xev.Children[0].OnlyAddr = false
 		return &(xev.Children[0]), nil
 	}
-	rv := xev.maybeDereference()
+	xev.loadPtr()
+	if xev.Unreadable != nil {
+		val, ok := constant.Uint64Val(xev.Value)
+		if ok && val == 0 {
+			return nil, fmt.Errorf("couldn't read pointer: %w", xev.Unreadable)
+		}
+	}
+	rv := &xev.Children[0]
 	if rv.Addr == 0 {
 		return nil, fmt.Errorf("nil pointer dereference")
 	}
@@ -2084,7 +2106,21 @@ func (v *Variable) sliceAccess(idx int) (*Variable, error) {
 		return nil, fmt.Errorf("index out of bounds")
 	}
 	if v.loaded {
-		return &v.Children[idx], nil
+		if v.Kind == reflect.String {
+			s := constant.StringVal(v.Value)
+			if idx >= len(s) {
+				return nil, fmt.Errorf("index out of bounds")
+			}
+			r := v.newVariable("", v.Base+uint64(int64(idx)*v.stride), v.fieldType, v.mem)
+			r.loaded = true
+			r.Value = constant.MakeInt64(int64(s[idx]))
+			return r, nil
+		} else {
+			if idx >= len(v.Children) {
+				return nil, fmt.Errorf("index out of bounds")
+			}
+			return &v.Children[idx], nil
+		}
 	}
 	mem := v.mem
 	if v.Kind != reflect.Array {

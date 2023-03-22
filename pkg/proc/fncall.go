@@ -152,6 +152,10 @@ func EvalExpressionWithCalls(grp *TargetGroup, g *G, expr string, retLoadCfg Loa
 	if !t.SupportsFunctionCalls() {
 		return errFuncCallUnsupportedBackend
 	}
+	producer := bi.Producer()
+	if producer == "" || !goversion.ProducerAfterOrEqual(bi.Producer(), 1, 12) {
+		return errFuncCallUnsupported
+	}
 
 	// check that the target goroutine is running
 	if g == nil {
@@ -615,7 +619,7 @@ func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *
 		}
 	}
 
-	//TODO(aarzilli): autmoatic wrapping in interfaces for cases not handled
+	//TODO(aarzilli): automatic wrapping in interfaces for cases not handled
 	// by convertToEface.
 
 	var formalArgVar *Variable
@@ -640,9 +644,6 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 	if err != nil {
 		return 0, nil, fmt.Errorf("DWARF read error: %v", err)
 	}
-
-	producer := bi.Producer()
-	trustArgOrder := producer != "" && goversion.ProducerAfterOrEqual(bi.Producer(), 1, 12)
 
 	if bi.regabi && fn.cu.optimized && fn.Name != "runtime.mallocgc" {
 		// Debug info for function arguments on optimized functions is currently
@@ -672,7 +673,7 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 		if bi.regabi {
 			formalArg, err = funcCallArgRegABI(fn, bi, entry, argname, typ, &argFrameSize)
 		} else {
-			formalArg, err = funcCallArgOldABI(fn, bi, entry, argname, typ, trustArgOrder, &argFrameSize)
+			formalArg, err = funcCallArgOldABI(fn, bi, entry, argname, typ, &argFrameSize)
 		}
 		if err != nil {
 			return 0, nil, err
@@ -707,7 +708,7 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 	return argFrameSize, formalArgs, nil
 }
 
-func funcCallArgOldABI(fn *Function, bi *BinaryInfo, entry reader.Variable, argname string, typ godwarf.Type, trustArgOrder bool, pargFrameSize *int64) (*funcCallArg, error) {
+func funcCallArgOldABI(fn *Function, bi *BinaryInfo, entry reader.Variable, argname string, typ godwarf.Type, pargFrameSize *int64) (*funcCallArg, error) {
 	const CFA = 0x1000
 	var off int64
 
@@ -726,10 +727,6 @@ func funcCallArgOldABI(fn *Function, bi *BinaryInfo, entry reader.Variable, argn
 		off -= CFA
 	}
 	if err != nil {
-		if !trustArgOrder {
-			return nil, err
-		}
-
 		// With Go version 1.12 or later we can trust that the arguments appear
 		// in the same order as declared, which means we can calculate their
 		// address automatically.
@@ -1248,9 +1245,17 @@ func debugCallProtocolReg(archName string, version int) (uint64, bool) {
 	}
 }
 
-type fakeEntry map[dwarf.Attr]interface{}
+type fakeEntry map[dwarf.Attr]*dwarf.Field
 
 func (e fakeEntry) Val(attr dwarf.Attr) interface{} {
+	if e[attr] == nil {
+		return nil
+	}
+
+	return e[attr].Val
+}
+
+func (e fakeEntry) AttrField(attr dwarf.Attr) *dwarf.Field {
 	return e[attr]
 }
 
@@ -1273,11 +1278,11 @@ func regabiMallocgcWorkaround(bi *BinaryInfo) ([]*godwarf.Tree, error) {
 		if err1 != nil {
 			return nil
 		}
-		var e fakeEntry = map[dwarf.Attr]interface{}{
-			dwarf.AttrName:     name,
-			dwarf.AttrType:     typ.Common().Offset,
-			dwarf.AttrLocation: []byte{byte(op.DW_OP_reg0) + byte(reg)},
-			dwarf.AttrVarParam: isret,
+		var e fakeEntry = map[dwarf.Attr]*dwarf.Field{
+			dwarf.AttrName:     &dwarf.Field{Attr: dwarf.AttrName, Val: name, Class: dwarf.ClassString},
+			dwarf.AttrType:     &dwarf.Field{Attr: dwarf.AttrType, Val: typ.Common().Offset, Class: dwarf.ClassReference},
+			dwarf.AttrLocation: &dwarf.Field{Attr: dwarf.AttrLocation, Val: []byte{byte(op.DW_OP_reg0) + byte(reg)}, Class: dwarf.ClassBlock},
+			dwarf.AttrVarParam: &dwarf.Field{Attr: dwarf.AttrVarParam, Val: isret, Class: dwarf.ClassFlag},
 		}
 
 		return &godwarf.Tree{

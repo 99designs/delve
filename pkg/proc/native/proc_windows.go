@@ -3,7 +3,6 @@ package native
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 	"unsafe"
 
@@ -24,11 +23,8 @@ type osProcessDetails struct {
 func (os *osProcessDetails) Close() {}
 
 // Launch creates and begins debugging a new process.
-func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, redirects [3]string) (*proc.Target, error) {
-	argv0Go, err := filepath.Abs(cmd[0])
-	if err != nil {
-		return nil, err
-	}
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, redirects [3]string) (*proc.TargetGroup, error) {
+	argv0Go := cmd[0]
 
 	env := proc.DisableAsyncPreemptEnv()
 
@@ -144,7 +140,7 @@ func findExePath(pid int) (string, error) {
 var debugPrivilegeRequested = false
 
 // Attach to an existing process with the given PID.
-func Attach(pid int, _ []string) (*proc.Target, error) {
+func Attach(pid int, _ []string) (*proc.TargetGroup, error) {
 	var aperr error
 	if !debugPrivilegeRequested {
 		debugPrivilegeRequested = true
@@ -431,7 +427,8 @@ func (dbp *nativeProcess) waitForDebugEvent(flags waitForDebugEventFlags) (threa
 	}
 }
 
-func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
+func trapWait(procgrp *processGroup, pid int) (*nativeThread, error) {
+	dbp := procgrp.procs[0]
 	var err error
 	var tid, exitCode int
 	dbp.execPtraceFunc(func() {
@@ -478,7 +475,8 @@ func (dbp *nativeProcess) resume() error {
 }
 
 // stop stops all running threads threads and sets breakpoints
-func (dbp *nativeProcess) stop(cctx *proc.ContinueOnceContext, trapthread *nativeThread) (*nativeThread, error) {
+func (procgrp *processGroup) stop(cctx *proc.ContinueOnceContext, trapthread *nativeThread) (*nativeThread, error) {
+	dbp := procgrp.procs[0]
 	if dbp.exited {
 		return nil, proc.ErrProcessExited{Pid: dbp.pid}
 	}

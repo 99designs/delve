@@ -144,8 +144,9 @@ See also: "help on", "help cond" and "help clear"`},
 The memory location is specified with the same expression language used by 'print', for example:
 
 	watch v
+	watch -w *(*int)(0x1400007c018)
 
-will watch the address of variable 'v'.
+will watch the address of variable 'v' and writes to an int at addr '0x1400007c018'.
 
 Note that writes that do not change the value of the watched memory address might not be reported.
 
@@ -475,7 +476,7 @@ With the -hitcount option a condition on the breakpoint hit count can be set, th
 
 The -per-g-hitcount option works like -hitcount, but use per goroutine hitcount to compare with n.
 
-With the -clear option a condtion on the breakpoint can removed.
+With the -clear option a condition on the breakpoint can removed.
 	
 The '% n' form means we should stop at the breakpoint when the hitcount is a multiple of n.
 
@@ -1753,14 +1754,18 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 	}
 	if findLocErr != nil && shouldAskToSuspendBreakpoint(t) {
 		fmt.Fprintf(os.Stderr, "Command failed: %s\n", findLocErr.Error())
-		findLocErr = nil
-		answer, err := yesno(t.line, "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?")
+		question := "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
+		if isErrProcessExited(findLocErr) {
+			question = "Set a suspended breakpoint (Delve will try to set this breakpoint when the process is restarted) [Y/n]?"
+		}
+		answer, err := yesno(t.line, question, "yes")
 		if err != nil {
 			return nil, err
 		}
 		if !answer {
 			return nil, nil
 		}
+		findLocErr = nil
 		bp, err := t.client.CreateBreakpointWithExpr(requestedBp, spec, t.substitutePathRules(), true)
 		if err != nil {
 			return nil, err
@@ -3220,5 +3225,6 @@ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
 
 func shouldAskToSuspendBreakpoint(t *Term) bool {
 	fns, _ := t.client.ListFunctions(`^plugin\.Open$`)
-	return len(fns) > 0
+	_, err := t.client.GetState()
+	return len(fns) > 0 || isErrProcessExited(err)
 }

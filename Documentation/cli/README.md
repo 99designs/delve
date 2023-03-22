@@ -199,7 +199,7 @@ With the -hitcount option a condition on the breakpoint hit count can be set, th
 
 The -per-g-hitcount option works like -hitcount, but use per goroutine hitcount to compare with n.
 
-With the -clear option a condtion on the breakpoint can removed.
+With the -clear option a condition on the breakpoint can removed.
 	
 The '% n' form means we should stop at the breakpoint when the hitcount is a multiple of n.
 
@@ -699,8 +699,9 @@ Set watchpoint.
 The memory location is specified with the same expression language used by 'print', for example:
 
 	watch v
+	watch -w *(*int)(0x1400007c018)
 
-will watch the address of variable 'v'.
+will watch the address of variable 'v' and writes to an int at addr '0x1400007c018'.
 
 Note that writes that do not change the value of the watched memory address might not be reported.
 

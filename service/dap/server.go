@@ -43,8 +43,6 @@ import (
 	"github.com/go-delve/delve/service/debugger"
 	"github.com/go-delve/delve/service/internal/sameuser"
 	"github.com/google/go-dap"
-
-	"github.com/sirupsen/logrus"
 )
 
 // Server implements a DAP server that can accept a single client for
@@ -167,7 +165,7 @@ type Config struct {
 	*service.Config
 
 	// log is used for structured logging.
-	log *logrus.Entry
+	log logflags.Logger
 	// StopTriggered is closed when the server is Stop()-ed.
 	// Can be used to safeguard against duplicate shutdown sequences.
 	StopTriggered chan struct{}
@@ -405,7 +403,7 @@ func (s *Session) Close() {
 	// can send client notifications.
 	// Unless Stop() was called after read loop in ServeDAPCodec()
 	// returned, this will result in a closed connection error
-	// on next read, breaking out the read loop andd
+	// on next read, breaking out the read loop and
 	// allowing the run goroutinee to exit.
 	// This connection is closed here and in serveDAPCodec().
 	// If this was a forced shutdown, external stop logic can close this first.
@@ -1411,7 +1409,7 @@ func (s *Session) updateBreakpointsResponse(breakpoints []dap.Breakpoint, i int,
 		path := s.toClientPath(got.File)
 		breakpoints[i].Id = got.ID
 		breakpoints[i].Line = got.Line
-		breakpoints[i].Source = dap.Source{Name: filepath.Base(path), Path: path}
+		breakpoints[i].Source = &dap.Source{Name: filepath.Base(path), Path: path}
 	}
 }
 
@@ -1775,7 +1773,7 @@ func (s *Session) onAttachRequest(request *dap.AttachRequest) {
 			s.send(&dap.CapabilitiesEvent{Event: *newEvent("capabilities"), Body: dap.CapabilitiesEventBody{Capabilities: dap.Capabilities{SupportTerminateDebuggee: true}}})
 			// TODO(polina): support SupportSuspendDebuggee when available
 		} else if s.config.Debugger.AttachPid > 0 {
-			// User can stop debugger with process or leave the processs running
+			// User can stop debugger with process or leave the process running
 			s.send(&dap.CapabilitiesEvent{Event: *newEvent("capabilities"), Body: dap.CapabilitiesEventBody{Capabilities: dap.Capabilities{SupportTerminateDebuggee: true}}})
 		} // else program was launched and the only option will be to stop both
 	default:
@@ -2694,7 +2692,7 @@ func (s *Session) onEvaluateRequest(request *dap.EvaluateRequest) {
 			opts |= showFullValue
 		}
 		exprVal, exprRef := s.convertVariableWithOpts(exprVar, fmt.Sprintf("(%s)", request.Arguments.Expression), opts)
-		response.Body = dap.EvaluateResponseBody{Result: exprVal, VariablesReference: exprRef, IndexedVariables: getIndexedVariableCount(exprVar), NamedVariables: getNamedVariableCount(exprVar)}
+		response.Body = dap.EvaluateResponseBody{Result: exprVal, Type: s.getTypeIfSupported(exprVar), VariablesReference: exprRef, IndexedVariables: getIndexedVariableCount(exprVar), NamedVariables: getNamedVariableCount(exprVar)}
 	}
 	s.send(response)
 }
@@ -2743,7 +2741,7 @@ func (s *Session) doCall(goid, frame int, expr string) (*api.DebuggerState, []*p
 	// After the call is done, the goroutine where we injected the call should
 	// return to the original stopped line with return values. However,
 	// it is not guaranteed to be selected due to the possibility of the
-	// of simultaenous breakpoints. Therefore, we check all threads.
+	// of simultaneous breakpoints. Therefore, we check all threads.
 	var retVars []*proc.Variable
 	found := false
 	for _, t := range state.Threads {

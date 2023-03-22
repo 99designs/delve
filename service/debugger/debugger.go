@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +31,6 @@ import (
 	"github.com/go-delve/delve/pkg/proc/gdbserial"
 	"github.com/go-delve/delve/pkg/proc/native"
 	"github.com/go-delve/delve/service/api"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -69,7 +69,7 @@ type Debugger struct {
 	targetMutex sync.Mutex
 	target      *proc.TargetGroup
 
-	log *logrus.Entry
+	log logflags.Logger
 
 	running      bool
 	runningMutex sync.Mutex
@@ -141,6 +141,8 @@ type Config struct {
 
 	// DisableASLR disables ASLR
 	DisableASLR bool
+
+	RrOnProcessPid int
 }
 
 // New creates a new Debugger. ProcessArgs specify the commandline arguments for the
@@ -161,30 +163,28 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 		if len(d.processArgs) > 0 {
 			path = d.processArgs[0]
 		}
-		p, err := d.Attach(d.config.AttachPid, path)
+		var err error
+		d.target, err = d.Attach(d.config.AttachPid, path)
 		if err != nil {
 			err = go11DecodeErrorCheck(err)
 			err = noDebugErrorWarning(err)
 			return nil, attachErrorMessage(d.config.AttachPid, err)
 		}
-		d.target = proc.NewGroup(p)
 
 	case d.config.CoreFile != "":
-		var p *proc.Target
 		var err error
 		switch d.config.Backend {
 		case "rr":
 			d.log.Infof("opening trace %s", d.config.CoreFile)
-			p, err = gdbserial.Replay(d.config.CoreFile, false, false, d.config.DebugInfoDirectories)
+			d.target, err = gdbserial.Replay(d.config.CoreFile, false, false, d.config.DebugInfoDirectories, d.config.RrOnProcessPid)
 		default:
 			d.log.Infof("opening core file %s (executable %s)", d.config.CoreFile, d.processArgs[0])
-			p, err = core.OpenCore(d.config.CoreFile, d.processArgs[0], d.config.DebugInfoDirectories)
+			d.target, err = core.OpenCore(d.config.CoreFile, d.processArgs[0], d.config.DebugInfoDirectories)
 		}
 		if err != nil {
 			err = go11DecodeErrorCheck(err)
 			return nil, err
 		}
-		d.target = proc.NewGroup(p)
 		if err := d.checkGoVersion(); err != nil {
 			d.target.Detach(true)
 			return nil, err
@@ -192,7 +192,8 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 
 	default:
 		d.log.Infof("launching process with args: %v", d.processArgs)
-		p, err := d.Launch(d.processArgs, d.config.WorkingDir)
+		var err error
+		d.target, err = d.Launch(d.processArgs, d.config.WorkingDir)
 		if err != nil {
 			if _, ok := err.(*proc.ErrUnsupportedArch); !ok {
 				err = go11DecodeErrorCheck(err)
@@ -200,10 +201,6 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 				err = fmt.Errorf("could not launch process: %s", err)
 			}
 			return nil, err
-		}
-		if p != nil {
-			// if p == nil and err == nil then we are doing a recording, don't touch d.target
-			d.target = proc.NewGroup(p)
 		}
 		if err := d.checkGoVersion(); err != nil {
 			d.target.Detach(true)
@@ -245,10 +242,12 @@ func (d *Debugger) TargetGoVersion() string {
 }
 
 // Launch will start a process with the given args and working directory.
-func (d *Debugger) Launch(processArgs []string, wd string) (*proc.Target, error) {
-	if err := verifyBinaryFormat(processArgs[0]); err != nil {
+func (d *Debugger) Launch(processArgs []string, wd string) (*proc.TargetGroup, error) {
+	fullpath, err := verifyBinaryFormat(processArgs[0])
+	if err != nil {
 		return nil, err
 	}
+	processArgs[0] = fullpath
 
 	launchFlags := proc.LaunchFlags(0)
 	if d.config.Foreground {
@@ -283,7 +282,7 @@ func (d *Debugger) Launch(processArgs []string, wd string) (*proc.Target, error)
 		go func() {
 			defer d.targetMutex.Unlock()
 
-			p, err := d.recordingRun(run)
+			grp, err := d.recordingRun(run)
 			if err != nil {
 				d.log.Errorf("could not record target: %v", err)
 				// this is ugly but we can't respond to any client requests at this
@@ -291,7 +290,7 @@ func (d *Debugger) Launch(processArgs []string, wd string) (*proc.Target, error)
 				os.Exit(1)
 			}
 			d.recordingDone()
-			d.target = proc.NewGroup(p)
+			d.target = grp
 			if err := d.checkGoVersion(); err != nil {
 				d.log.Error(err)
 				err := d.target.Detach(true)
@@ -330,17 +329,17 @@ func (d *Debugger) isRecording() bool {
 	return d.stopRecording != nil
 }
 
-func (d *Debugger) recordingRun(run func() (string, error)) (*proc.Target, error) {
+func (d *Debugger) recordingRun(run func() (string, error)) (*proc.TargetGroup, error) {
 	tracedir, err := run()
 	if err != nil && tracedir == "" {
 		return nil, err
 	}
 
-	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories)
+	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories, 0)
 }
 
 // Attach will attach to the process specified by 'pid'.
-func (d *Debugger) Attach(pid int, path string) (*proc.Target, error) {
+func (d *Debugger) Attach(pid int, path string) (*proc.TargetGroup, error) {
 	switch d.config.Backend {
 	case "native":
 		return native.Attach(pid, d.config.DebugInfoDirectories)
@@ -358,7 +357,7 @@ func (d *Debugger) Attach(pid int, path string) (*proc.Target, error) {
 
 var errMacOSBackendUnavailable = errors.New("debugserver or lldb-server not found: install Xcode's command line tools or lldb-server")
 
-func betterGdbserialLaunchError(p *proc.Target, err error) (*proc.Target, error) {
+func betterGdbserialLaunchError(p *proc.TargetGroup, err error) (*proc.TargetGroup, error) {
 	if runtime.GOOS != "darwin" {
 		return p, err
 	}
@@ -480,7 +479,7 @@ func (d *Debugger) Restart(rerecord bool, pos string, resetArgs bool, newArgs []
 		d.processArgs = append([]string{d.processArgs[0]}, newArgs...)
 		d.config.Redirects = newRedirects
 	}
-	var p *proc.Target
+	var grp *proc.TargetGroup
 	var err error
 
 	if rebuild {
@@ -508,19 +507,20 @@ func (d *Debugger) Restart(rerecord bool, pos string, resetArgs bool, newArgs []
 		}
 
 		d.recordingStart(stop)
-		p, err = d.recordingRun(run)
+		grp, err = d.recordingRun(run)
 		d.recordingDone()
 	} else {
-		p, err = d.Launch(d.processArgs, d.config.WorkingDir)
+		grp, err = d.Launch(d.processArgs, d.config.WorkingDir)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("could not launch process: %s", err)
 	}
 
 	discarded := []api.DiscardedBreakpoint{}
-	d.target = proc.NewGroupRestart(p, d.target, func(oldBp *proc.LogicalBreakpoint, err error) {
+	proc.Restart(grp, d.target, func(oldBp *proc.LogicalBreakpoint, err error) {
 		discarded = append(discarded, api.DiscardedBreakpoint{Breakpoint: api.ConvertLogicalBreakpoint(oldBp), Reason: err.Error()})
 	})
+	d.target = grp
 	return discarded, nil
 }
 
@@ -769,13 +769,15 @@ func (d *Debugger) ConvertThreadBreakpoint(thread proc.Thread) *api.Breakpoint {
 func createLogicalBreakpoint(d *Debugger, requestedBp *api.Breakpoint, setbp *proc.SetBreakpoint, suspended bool) (*api.Breakpoint, error) {
 	id := requestedBp.ID
 
-	var lbp *proc.LogicalBreakpoint
 	if id <= 0 {
 		d.breakpointIDCounter++
 		id = d.breakpointIDCounter
-		lbp = &proc.LogicalBreakpoint{LogicalID: id, HitCount: make(map[int64]uint64), Enabled: true}
-		d.target.LogicalBreakpoints[id] = lbp
+	} else {
+		d.breakpointIDCounter = id
 	}
+
+	lbp := &proc.LogicalBreakpoint{LogicalID: id, HitCount: make(map[int64]uint64), Enabled: true}
+	d.target.LogicalBreakpoints[id] = lbp
 
 	err := copyLogicalBreakpointInfo(lbp, requestedBp)
 	if err != nil {
@@ -783,6 +785,18 @@ func createLogicalBreakpoint(d *Debugger, requestedBp *api.Breakpoint, setbp *pr
 	}
 
 	lbp.Set = *setbp
+
+	if lbp.Set.Expr != nil {
+		addrs := lbp.Set.Expr(d.Target())
+		if len(addrs) > 0 {
+			f, l, fn := d.Target().BinInfo().PCToLine(addrs[0])
+			lbp.File = f
+			lbp.Line = l
+			if fn != nil {
+				lbp.FunctionName = fn.Name
+			}
+		}
+	}
 
 	err = d.target.EnableBreakpoint(lbp)
 	if err != nil {
@@ -960,10 +974,6 @@ func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint
 
 // clearBreakpoint clears a breakpoint, we can consume this function to avoid locking a goroutine
 func (d *Debugger) clearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint, error) {
-	if _, err := d.target.Valid(); err != nil {
-		return nil, err
-	}
-
 	if requestedBp.ID <= 0 {
 		if len(d.target.Targets()) != 1 {
 			return nil, ErrNotImplementedWithMultitarget
@@ -1309,7 +1319,7 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
 	bpi := &api.BreakpointInfo{}
 	apiThread.BreakpointInfo = bpi
 
-	tgt := d.target.TargetForThread(thread)
+	tgt := d.target.TargetForThread(thread.ThreadID())
 
 	if bp.Goroutine {
 		g, err := proc.GetG(thread)
@@ -1556,8 +1566,8 @@ func (d *Debugger) Function(goid int64, frame, deferredCall int, cfg proc.LoadCo
 	return s.Fn, nil
 }
 
-// EvalVariableInScope will attempt to evaluate the variable represented by 'symbol'
-// in the scope provided.
+// EvalVariableInScope will attempt to evaluate the 'expr' in the scope
+// corresponding to the given 'frame' on the goroutine identified by 'goid'.
 func (d *Debugger) EvalVariableInScope(goid int64, frame, deferredCall int, expr string, cfg proc.LoadConfig) (*proc.Variable, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
@@ -2129,7 +2139,7 @@ func (d *Debugger) DumpStart(dest string) error {
 
 	//TODO(aarzilli): what do we do if the user switches to a different target after starting a dump but before it's finished?
 
-	if !d.target.Selected.CanDump {
+	if !d.target.CanDump {
 		d.targetMutex.Unlock()
 		return ErrCoreDumpNotSupported
 	}
@@ -2259,34 +2269,31 @@ func noDebugErrorWarning(err error) error {
 	return err
 }
 
-func verifyBinaryFormat(exePath string) error {
-	f, err := os.Open(exePath)
+func verifyBinaryFormat(exePath string) (string, error) {
+	fullpath, err := filepath.Abs(exePath)
 	if err != nil {
-		return err
+		return "", err
+	}
+
+	f, err := os.Open(fullpath)
+	if err != nil {
+		return "", err
 	}
 	defer f.Close()
 
-	switch runtime.GOOS {
-	case "windows":
-		// Make sure the binary exists and is an executable file
-		if filepath.Base(exePath) == exePath {
-			if _, err := exec.LookPath(exePath); err != nil {
-				return err
-			}
-		}
-	default:
-		fi, err := f.Stat()
+	// Skip this check on Windows.
+	// TODO(derekparker) exec.LookPath looks for valid Windows extensions.
+	// We don't create our binaries with valid extensions, even though we should.
+	// Skip this check for now.
+	if runtime.GOOS != "windows" {
+		_, err = exec.LookPath(fullpath)
 		if err != nil {
-			return err
-		}
-		if (fi.Mode() & 0111) == 0 {
-			return api.ErrNotExecutable
+			return "", api.ErrNotExecutable
 		}
 	}
 
 	// check that the binary format is what we expect for the host system
-	var exe interface{ Close() error }
-
+	var exe io.Closer
 	switch runtime.GOOS {
 	case "darwin":
 		exe, err = macho.NewFile(f)
@@ -2299,10 +2306,10 @@ func verifyBinaryFormat(exePath string) error {
 	}
 
 	if err != nil {
-		return api.ErrNotExecutable
+		return "", api.ErrNotExecutable
 	}
 	exe.Close()
-	return nil
+	return fullpath, nil
 }
 
 var attachErrorMessage = attachErrorMessageDefault

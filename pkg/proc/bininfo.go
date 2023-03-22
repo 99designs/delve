@@ -23,18 +23,17 @@ import (
 	"sync"
 	"time"
 
+	pdwarf "github.com/go-delve/delve/pkg/dwarf"
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/line"
 	"github.com/go-delve/delve/pkg/dwarf/loclist"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
-	"github.com/go-delve/delve/pkg/dwarf/util"
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc/debuginfod"
 	"github.com/hashicorp/golang-lru/simplelru"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -94,7 +93,8 @@ type BinaryInfo struct {
 	types       map[string]dwarfRef
 	packageVars []packageVar // packageVars is a list of all global/package variables in debug_info, sorted by address
 
-	gStructOffset uint64
+	gStructOffset      uint64
+	gStructOffsetIsPtr bool
 
 	// consts[off] lists all the constants with the type defined at offset off.
 	consts constantsMap
@@ -110,7 +110,7 @@ type BinaryInfo struct {
 	// Go 1.17 register ABI is enabled.
 	regabi bool
 
-	logger *logrus.Entry
+	logger logflags.Logger
 }
 
 var (
@@ -700,7 +700,7 @@ func loadBinaryInfo(bi *BinaryInfo, image *Image, path string, entryPoint uint64
 // struct in thread local storage.
 func (bi *BinaryInfo) GStructOffset(mem MemoryReadWriter) (uint64, error) {
 	offset := bi.gStructOffset
-	if bi.GOOS == "windows" && bi.Arch.Name == "arm64" {
+	if bi.gStructOffsetIsPtr {
 		// The G struct offset from the TLS section is a pointer
 		// and the address must be dereferenced to find to actual G struct offset.
 		var err error
@@ -943,7 +943,7 @@ func (image *Image) Close() error {
 	return err2
 }
 
-func (image *Image) setLoadError(logger *logrus.Entry, fmtstr string, args ...interface{}) {
+func (image *Image) setLoadError(logger logflags.Logger, fmtstr string, args ...interface{}) {
 	image.loadErrMu.Lock()
 	image.loadErr = fmt.Errorf(fmtstr, args...)
 	image.loadErrMu.Unlock()
@@ -1055,7 +1055,7 @@ func (bi *BinaryInfo) LocationCovers(entry *dwarf.Entry, attr dwarf.Attr) ([][2]
 		return nil, fmt.Errorf("attribute %s not found", attr)
 	}
 	if _, isblock := a.([]byte); isblock {
-		return [][2]uint64{[2]uint64{0, ^uint64(0)}}, nil
+		return [][2]uint64{{0, ^uint64(0)}}, nil
 	}
 
 	off, ok := a.(int64)
@@ -1291,6 +1291,9 @@ func (bi *BinaryInfo) openSeparateDebugInfo(image *Image, exe *elf.File, debugIn
 				suffix := filepath.Join(filepath.Dir(exePath)[1:], debugLink)
 				find(nil, suffix)
 			}
+			if debugFilePath == "" {
+				bi.logger.Warnf("gnu_debuglink link %q not found in any debug info directory", debugLink)
+			}
 		}
 
 		if debugFilePath != "" {
@@ -1308,7 +1311,7 @@ func (bi *BinaryInfo) openSeparateDebugInfo(image *Image, exe *elf.File, debugIn
 	}
 
 	if debugFilePath == "" && len(bi.BuildID) > 2 {
-		// Previous verrsions of delve looked for the build id in every debug info
+		// Previous versions of delve looked for the build id in every debug info
 		// directory that contained the build-id substring. This behavior deviates
 		// from the ones specified by GDB but we keep it for backwards compatibility.
 		find(func(dir string) bool { return strings.Contains(dir, "build-id") }, fmt.Sprintf("%s/%s.debug", bi.BuildID[:2], bi.BuildID[2:]))
@@ -1516,7 +1519,12 @@ func (bi *BinaryInfo) parseDebugFrameElf(image *Image, dwarfFile, exeFile *elf.F
 	var ehFrameAddr uint64
 	if ehFrameSection != nil {
 		ehFrameAddr = ehFrameSection.Addr
-		ehFrameData, _ = ehFrameSection.Data()
+		// Workaround for go.dev/cl/429601
+		if ehFrameSection.Type == elf.SHT_NOBITS {
+			ehFrameData = make([]byte, ehFrameSection.Size)
+		} else {
+			ehFrameData, _ = ehFrameSection.Data()
+		}
 	}
 
 	bi.parseDebugFrameGeneral(image, debugFrameData, ".debug_frame", debugFrameErr, ehFrameData, ehFrameAddr, ".eh_frame", frame.DwarfEndian(debugInfoBytes))
@@ -1534,7 +1542,7 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 	//   emitting runtime.tlsg, a TLS symbol, which is relocated to the chosen
 	//   offset in libc's TLS block.
 	// - On ARM64 (but really, any architecture other than i386 and 86x64) the
-	//   offset is calculate using runtime.tls_g and the formula is different.
+	//   offset is calculated using runtime.tls_g and the formula is different.
 
 	var tls *elf.Prog
 	for _, prog := range exe.Progs {
@@ -1577,7 +1585,7 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 	}
 }
 
-func getSymbol(image *Image, logger *logrus.Entry, exe *elf.File, name string) *elf.Symbol {
+func getSymbol(image *Image, logger logflags.Logger, exe *elf.File, name string) *elf.Symbol {
 	symbols, err := exe.Symbols()
 	if err != nil {
 		image.setLoadError(logger, "could not parse ELF symbols: %v", err)
@@ -1642,38 +1650,52 @@ func loadBinaryInfoPE(bi *BinaryInfo, image *Image, path string, entryPoint uint
 
 	wg.Add(2)
 	go bi.parseDebugFramePE(image, peFile, debugInfoBytes, wg)
-	go bi.loadDebugInfoMaps(image, debugInfoBytes, debugLineBytes, wg, nil)
-	if image.index == 0 {
-		// determine g struct offset only when loading the executable file
-		wg.Add(1)
-		go bi.setGStructOffsetPE(entryPoint, peFile, wg)
-	}
+	go bi.loadDebugInfoMaps(image, debugInfoBytes, debugLineBytes, wg, func() {
+		// setGStructOffsetPE requires the image compile units to be loaded,
+		// so it can't be called concurrently with loadDebugInfoMaps.
+		if image.index == 0 {
+			// determine g struct offset only when loading the executable file.
+			bi.setGStructOffsetPE(entryPoint, peFile)
+		}
+	})
 	return nil
 }
 
-func (bi *BinaryInfo) setGStructOffsetPE(entryPoint uint64, peFile *pe.File, wg *sync.WaitGroup) {
-	defer wg.Done()
-	switch _PEMachine(peFile.Machine) {
-	case _IMAGE_FILE_MACHINE_AMD64:
-		// Use ArbitraryUserPointer (0x28) as pointer to pointer
-		// to G struct per:
-		// https://golang.org/src/runtime/cgo/gcc_windows_amd64.c
-		bi.gStructOffset = 0x28
-	case _IMAGE_FILE_MACHINE_ARM64:
-		// Use runtime.tls_g as pointer to offset from R18 to G struct:
-		// https://golang.org/src/runtime/sys_windows_arm64.s:runtime·wintls
+func (bi *BinaryInfo) setGStructOffsetPE(entryPoint uint64, peFile *pe.File) {
+	readtls_g := func() uint64 {
 		for _, s := range peFile.Symbols {
 			if s.Name == "runtime.tls_g" {
 				i := int(s.SectionNumber) - 1
 				if 0 <= i && i < len(peFile.Sections) {
 					sect := peFile.Sections[i]
 					if s.Value < sect.VirtualSize {
-						bi.gStructOffset = entryPoint + uint64(sect.VirtualAddress) + uint64(s.Value)
+						return entryPoint + uint64(sect.VirtualAddress) + uint64(s.Value)
 					}
 				}
 				break
 			}
 		}
+		return 0
+	}
+	switch _PEMachine(peFile.Machine) {
+	case _IMAGE_FILE_MACHINE_AMD64:
+		producer := bi.Producer()
+		if producer != "" && goversion.ProducerAfterOrEqual(producer, 1, 20) {
+			// Use runtime.tls_g as pointer to offset from GS to G struct:
+			// https://golang.org/src/runtime/sys_windows_amd64.s
+			bi.gStructOffset = readtls_g()
+			bi.gStructOffsetIsPtr = true
+		} else {
+			// Use ArbitraryUserPointer (0x28) as pointer to pointer
+			// to G struct per:
+			// https://golang.org/src/runtime/cgo/gcc_windows_amd64.c
+			bi.gStructOffset = 0x28
+		}
+	case _IMAGE_FILE_MACHINE_ARM64:
+		// Use runtime.tls_g as pointer to offset from R18 to G struct:
+		// https://golang.org/src/runtime/sys_windows_arm64.s
+		bi.gStructOffset = readtls_g()
+		bi.gStructOffsetIsPtr = true
 	}
 }
 
@@ -1786,8 +1808,7 @@ func (bi *BinaryInfo) parseDebugFrameMacho(image *Image, exe *macho.File, debugI
 //
 // [golang/go#25841]: https://github.com/golang/go/issues/25841
 func (bi *BinaryInfo) macOSDebugFrameBugWorkaround() {
-	//TODO: log extensively because of bugs in the field
-	if bi.GOOS != "darwin" || bi.Arch.Name != "arm64" {
+	if bi.GOOS != "darwin" {
 		return
 	}
 	if len(bi.Images) > 1 {
@@ -1800,9 +1821,28 @@ func (bi *BinaryInfo) macOSDebugFrameBugWorkaround() {
 	if !ok {
 		return
 	}
-	if exe.Flags&macho.FlagPIE == 0 {
-		bi.logger.Infof("debug_frame workaround not needed: not a PIE (%#x)", exe.Flags)
-		return
+	if bi.Arch.Name == "arm64" {
+		if exe.Flags&macho.FlagPIE == 0 {
+			bi.logger.Infof("debug_frame workaround not needed: not a PIE (%#x)", exe.Flags)
+			return
+		}
+	} else {
+		prod := goversion.ParseProducer(bi.Producer())
+		if !prod.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 19, Rev: 3}) && !prod.IsDevel() {
+			bi.logger.Infof("debug_frame workaround not needed (version %q on %s)", bi.Producer(), bi.Arch.Name)
+			return
+		}
+		found := false
+		for i := range bi.frameEntries {
+			if bi.frameEntries[i].CIE.CIE_id == ^uint32(0) && bi.frameEntries[i].Begin() < 0x4000000 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			bi.logger.Infof("debug_frame workaround not needed (all FDEs above 0x4000000)")
+			return
+		}
 	}
 
 	// Find first Go function (first = lowest entry point)
@@ -1858,8 +1898,8 @@ func (bi *BinaryInfo) macOSDebugFrameBugWorkaround() {
 
 // Do not call this function directly it isn't able to deal correctly with package paths
 func (bi *BinaryInfo) findType(name string) (godwarf.Type, error) {
-	name = strings.Replace(name, "interface{", "interface {", -1)
-	name = strings.Replace(name, "struct{", "struct {", -1)
+	name = strings.ReplaceAll(name, "interface{", "interface {")
+	name = strings.ReplaceAll(name, "struct{", "struct {")
 	ref, found := bi.types[name]
 	if !found {
 		return nil, reader.ErrTypeNotFound
@@ -1988,7 +2028,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 
 	image.runtimeTypeToDIE = make(map[uint64]runtimeTypeDIE)
 
-	ctxt := newLoadDebugInfoMapsContext(bi, image, util.ReadUnitVersions(debugInfoBytes))
+	ctxt := newLoadDebugInfoMapsContext(bi, image, pdwarf.ReadUnitVersions(debugInfoBytes))
 
 	reader := image.DwarfReader()
 
@@ -2028,11 +2068,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			if hasLineInfo && lineInfoOffset >= 0 && lineInfoOffset < int64(len(debugLineBytes)) {
 				var logfn func(string, ...interface{})
 				if logflags.DebugLineErrors() {
-					logger := logrus.New().WithFields(logrus.Fields{"layer": "dwarf-line"})
-					logger.Logger.Level = logrus.DebugLevel
-					logfn = func(fmt string, args ...interface{}) {
-						logger.Printf(fmt, args)
-					}
+					logfn = logflags.DebugLineLogger().Printf
 				}
 				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), image.debugLineStr, logfn, image.StaticBase, bi.GOOS == "windows", bi.Arch.PtrSize())
 			}
@@ -2055,7 +2091,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			}
 			gopkg, _ := entry.Val(godwarf.AttrGoPackageName).(string)
 			if cu.isgo && gopkg != "" {
-				bi.PackageMap[gopkg] = append(bi.PackageMap[gopkg], escapePackagePath(strings.Replace(cu.name, "\\", "/", -1)))
+				bi.PackageMap[gopkg] = append(bi.PackageMap[gopkg], escapePackagePath(strings.ReplaceAll(cu.name, "\\", "/")))
 			}
 			image.compileUnits = append(image.compileUnits, cu)
 			if entry.Children {
@@ -2112,7 +2148,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 	}
 }
 
-// LookupGenericFunc returns a map that allows searching for instantiations of generic function by specificying a function name without type parameters.
+// LookupGenericFunc returns a map that allows searching for instantiations of generic function by specifying a function name without type parameters.
 // For example the key "pkg.(*Receiver).Amethod" will find all instantiations of Amethod:
 //   - pkg.(*Receiver[.shape.int]).Amethod
 //   - pkg.(*Receiver[.shape.*uint8]).Amethod
@@ -2176,7 +2212,7 @@ func (bi *BinaryInfo) loadDebugInfoMapsCompileUnit(ctxt *loadDebugInfoMapsContex
 				var addr uint64
 				if loc, ok := entry.Val(dwarf.AttrLocation).([]byte); ok {
 					if len(loc) == bi.Arch.PtrSize()+1 && op.Opcode(loc[0]) == op.DW_OP_addr {
-						addr, _ = util.ReadUintRaw(bytes.NewReader(loc[1:]), binary.LittleEndian, bi.Arch.PtrSize())
+						addr, _ = pdwarf.ReadUintRaw(bytes.NewReader(loc[1:]), binary.LittleEndian, bi.Arch.PtrSize())
 					}
 				}
 				if !cu.isgo {
@@ -2474,7 +2510,7 @@ func escapePackagePath(pkg string) string {
 	if slash < 0 {
 		slash = 0
 	}
-	return pkg[:slash] + strings.Replace(pkg[slash:], ".", "%2e", -1)
+	return pkg[:slash] + strings.ReplaceAll(pkg[slash:], ".", "%2e")
 }
 
 // Looks up symbol (either functions or global variables) at address addr.
@@ -2525,7 +2561,7 @@ func (bi *BinaryInfo) ListPackagesBuildInfo(includeFiles bool) []*PackageBuildIn
 			continue
 		}
 
-		ip := strings.Replace(cu.name, "\\", "/", -1)
+		ip := strings.ReplaceAll(cu.name, "\\", "/")
 		if _, ok := m[ip]; !ok {
 			path := cu.lineInfo.FirstFile()
 			if ext := filepath.Ext(path); ext != ".go" && ext != ".s" {

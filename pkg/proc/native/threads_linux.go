@@ -22,6 +22,9 @@ type osSpecificDetails struct {
 func (t *nativeThread) stop() (err error) {
 	err = sys.Tgkill(t.dbp.pid, t.ID, sys.SIGSTOP)
 	if err != nil {
+		if err == sys.ESRCH {
+			return
+		}
 		err = fmt.Errorf("stop err %s on thread %d", err, t.ID)
 		return
 	}
@@ -119,4 +122,24 @@ func (t *nativeThread) ReadMemory(data []byte, addr uint64) (n int, err error) {
 // SoftExc returns true if this thread received a software exception during the last resume.
 func (t *nativeThread) SoftExc() bool {
 	return t.os.setbp
+}
+
+// Continue the execution of this thread.
+//
+// If we are currently at a breakpoint, we'll clear it
+// first and then resume execution. Thread will continue until
+// it hits a breakpoint or is signaled.
+func (t *nativeThread) Continue() error {
+	pc, err := t.PC()
+	if err != nil {
+		return err
+	}
+	// Check whether we are stopped at a breakpoint, and
+	// if so, single step over it before continuing.
+	if _, ok := t.dbp.FindBreakpoint(pc, false); ok {
+		if err := t.StepInstruction(); err != nil {
+			return err
+		}
+	}
+	return t.resume()
 }

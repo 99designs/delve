@@ -81,7 +81,7 @@ const (
 	// the variable is the return value of a function call and allocated on a
 	// frame that no longer exists)
 	VariableFakeAddress
-	// VariableCPrt means the variable is a C pointer
+	// VariableCPtr means the variable is a C pointer
 	VariableCPtr
 	// VariableCPURegister means this variable is a CPU register.
 	VariableCPURegister
@@ -124,6 +124,9 @@ type Variable struct {
 	// number of elements to skip when loading a map
 	mapSkip int
 
+	// Children lists the variables sub-variables. What constitutes a child
+	// depends on the variable's type. For pointers, there's one child
+	// representing the pointed-to variable.
 	Children []Variable
 
 	loaded     bool
@@ -874,8 +877,8 @@ func (v *Variable) parseG() (*G, error) {
 	if bpvar := schedVar.fieldVariable("bp"); /* +rtype -opt uintptr */ bpvar != nil && bpvar.Value != nil {
 		bp, _ = constant.Int64Val(bpvar.Value)
 	}
-	if bpvar := schedVar.fieldVariable("lr"); /* +rtype -opt uintptr */ bpvar != nil && bpvar.Value != nil {
-		lr, _ = constant.Int64Val(bpvar.Value)
+	if lrvar := schedVar.fieldVariable("lr"); /* +rtype -opt uintptr */ lrvar != nil && lrvar.Value != nil {
+		lr, _ = constant.Int64Val(lrvar.Value)
 	}
 
 	unreadable := false
@@ -1185,7 +1188,7 @@ func extractVarInfoFromEntry(tgt *Target, bi *BinaryInfo, image *Image, regs op.
 		return nil, err
 	}
 
-	t, err = resolveParametricType(tgt, bi, mem, t, dictAddr)
+	t, err = resolveParametricType(bi, mem, t, dictAddr)
 	if err != nil {
 		// Log the error, keep going with t, which will be the shape type
 		logflags.DebuggerLogger().Errorf("could not resolve parametric type of %s", n)
@@ -1244,6 +1247,40 @@ func (v *Variable) maybeDereference() *Variable {
 	}
 }
 
+// loadPtr assumes that v is a pointer and loads its value. v also gets a child
+// variable, representing the pointed-to value. If v is already loaded,
+// loadPtr() is a no-op.
+func (v *Variable) loadPtr() {
+	if len(v.Children) > 0 {
+		// We've already loaded this variable.
+		return
+	}
+
+	t := v.RealType.(*godwarf.PtrType)
+	v.Len = 1
+
+	var child *Variable
+	if v.Unreadable == nil {
+		ptrval, err := readUintRaw(v.mem, v.Addr, t.ByteSize)
+		if err == nil {
+			child = v.newVariable("", ptrval, t.Type, DereferenceMemory(v.mem))
+		} else {
+			// We failed to read the pointer value; mark v as unreadable.
+			v.Unreadable = err
+		}
+	}
+
+	if v.Unreadable != nil {
+		// Pointers get a child even if their value can't be read, to
+		// maintain backwards compatibility.
+		child = v.newVariable("", 0 /* addr */, t.Type, DereferenceMemory(v.mem))
+		child.Unreadable = fmt.Errorf("parent pointer unreadable: %w", v.Unreadable)
+	}
+
+	v.Children = []Variable{*child}
+	v.Value = constant.MakeUint64(v.Children[0].Addr)
+}
+
 func loadValues(vars []*Variable, cfg LoadConfig) {
 	for i := range vars {
 		vars[i].loadValueInternal(0, cfg)
@@ -1263,8 +1300,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 	v.loaded = true
 	switch v.Kind {
 	case reflect.Ptr, reflect.UnsafePointer:
-		v.Len = 1
-		v.Children = []Variable{*v.maybeDereference()}
+		v.loadPtr()
 		if cfg.FollowPointers {
 			// Don't increase the recursion level when dereferencing pointers
 			// unless this is a pointer to interface (which could cause an infinite loop)
@@ -1392,7 +1428,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 
 // convertToEface converts srcv into an "interface {}" and writes it to
 // dstv.
-// Dstv must be a variable of type "inteface {}" and srcv must either be an
+// Dstv must be a variable of type "interface {}" and srcv must either be an
 // interface or a pointer shaped variable (map, channel, pointer or struct
 // containing a single pointer)
 func convertToEface(srcv, dstv *Variable) error {
@@ -1618,6 +1654,10 @@ func (v *Variable) loadArrayValues(recurseLevel int, cfg LoadConfig) {
 	if v.Len < 0 {
 		//lint:ignore ST1005 backwards compatibility
 		v.Unreadable = errors.New("Negative array length")
+		return
+	}
+	if v.Base == 0 && v.Len > 0 {
+		v.Unreadable = errors.New("non-zero length array with nil base")
 		return
 	}
 
@@ -2293,7 +2333,7 @@ func (v *Variable) ConstDescr() string {
 	}
 	if typename := v.DwarfType.Common().Name; !strings.Contains(typename, ".") || strings.HasPrefix(typename, "C.") {
 		// only attempt to use constants for user defined type, otherwise every
-		// int variable with value 1 will be described with os.SEEK_CUR and other
+		// int variable with value 1 will be described with io.SeekCurrent and other
 		// similar problems.
 		return ""
 	}
@@ -2555,6 +2595,10 @@ func (v *Variable) formatTime() {
 	} else {
 		// the full signed 64-bit wall seconds since Jan 1 year 1 is stored in ext
 		var t time.Time
+		if ext > int64(maxAddSeconds/time.Second)*1000 {
+			// avoid doing the add loop below if it will take too much time
+			return
+		}
 		for ext > int64(maxAddSeconds/time.Second) {
 			t = t.Add(maxAddSeconds)
 			ext -= int64(maxAddSeconds / time.Second)

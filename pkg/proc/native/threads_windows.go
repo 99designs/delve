@@ -46,7 +46,7 @@ func (t *nativeThread) singleStep() error {
 	// runtime it will have a suspend count greater than 1 and to actually take
 	// a single step we have to resume it multiple times here.
 	// We keep a counter of how many times it was suspended so that after
-	// single-stepping we can re-suspend it the corrent number of times.
+	// single-stepping we can re-suspend it the correct number of times.
 	for {
 		n, err := _ResumeThread(t.os.hThread)
 		if err != nil {
@@ -105,22 +105,6 @@ func (t *nativeThread) singleStep() error {
 	context.SetTrap(false)
 
 	return t.setContext(context)
-}
-
-func (t *nativeThread) resume() error {
-	var err error
-	t.dbp.execPtraceFunc(func() {
-		//TODO: Note that we are ignoring the thread we were asked to continue and are continuing the
-		//thread that we last broke on.
-		err = _ContinueDebugEvent(uint32(t.dbp.pid), uint32(t.ID), _DBG_CONTINUE)
-	})
-	return err
-}
-
-// Stopped returns whether the thread is stopped at the operating system
-// level. On windows this always returns true.
-func (t *nativeThread) Stopped() bool {
-	return true
 }
 
 func (t *nativeThread) WriteMemory(addr uint64, data []byte) (int, error) {

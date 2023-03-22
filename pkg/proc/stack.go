@@ -407,7 +407,14 @@ func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uin
 
 	callimage := it.bi.PCToImage(it.pc)
 
-	callFrameRegs = op.DwarfRegisters{StaticBase: callimage.StaticBase, ByteOrder: it.regs.ByteOrder, PCRegNum: it.regs.PCRegNum, SPRegNum: it.regs.SPRegNum, BPRegNum: it.regs.BPRegNum, LRRegNum: it.regs.LRRegNum}
+	callFrameRegs = op.DwarfRegisters{
+		StaticBase: callimage.StaticBase,
+		ByteOrder:  it.regs.ByteOrder,
+		PCRegNum:   it.regs.PCRegNum,
+		SPRegNum:   it.regs.SPRegNum,
+		BPRegNum:   it.regs.BPRegNum,
+		LRRegNum:   it.regs.LRRegNum,
+	}
 
 	// According to the standard the compiler should be responsible for emitting
 	// rules for the RSP register so that it can then be used to calculate CFA,
@@ -616,7 +623,7 @@ func (d *Defer) load() {
 }
 
 // errSPDecreased is used when (*Defer).Next detects a corrupted linked
-// list, specifically when after followin a link pointer the value of SP
+// list, specifically when after following a link pointer the value of SP
 // decreases rather than increasing or staying the same (the defer list is a
 // FIFO list, nodes further down the list have been added by function calls
 // further down the call stack and therefore the SP should always increase).
