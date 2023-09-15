@@ -19,6 +19,7 @@ import (
 
 	sys "golang.org/x/sys/unix"
 
+	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 	"github.com/go-delve/delve/pkg/proc/linutil"
@@ -62,7 +63,7 @@ func (os *osProcessDetails) Close() {
 // to be supplied to that process. `wd` is working directory of the program.
 // If the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []string, tty string, redirects [3]string) (*proc.TargetGroup, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []string, tty string, stdinPath string, stdoutOR proc.OutputRedirect, stderrOR proc.OutputRedirect) (*proc.TargetGroup, error) {
 	var (
 		process *exec.Cmd
 		err     error
@@ -70,7 +71,7 @@ func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []str
 
 	foreground := flags&proc.LaunchForeground != 0
 
-	stdin, stdout, stderr, closefn, err := openRedirects(redirects, foreground)
+	stdin, stdout, stderr, closefn, err := openRedirects(stdinPath, stdoutOR, stderrOR, foreground)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +85,7 @@ func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []str
 	dbp := newProcess(0)
 	defer func() {
 		if err != nil && dbp.pid != 0 {
-			_ = dbp.Detach(true)
+			_ = detachWithoutGroup(dbp, true)
 		}
 	}()
 	dbp.execPtraceFunc(func() {
@@ -141,7 +142,15 @@ func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []str
 // Attach to an existing process with the given PID. Once attached, if
 // the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Attach(pid int, debugInfoDirs []string) (*proc.TargetGroup, error) {
+func Attach(pid int, waitFor *proc.WaitFor, debugInfoDirs []string) (*proc.TargetGroup, error) {
+	if waitFor.Valid() {
+		var err error
+		pid, err = WaitFor(waitFor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	dbp := newProcess(pid)
 
 	var err error
@@ -156,7 +165,7 @@ func Attach(pid int, debugInfoDirs []string) (*proc.TargetGroup, error) {
 
 	tgt, err := dbp.initialize(findExecutable("", dbp.pid), debugInfoDirs)
 	if err != nil {
-		_ = dbp.Detach(false)
+		_ = detachWithoutGroup(dbp, false)
 		return nil, err
 	}
 
@@ -169,7 +178,54 @@ func Attach(pid int, debugInfoDirs []string) (*proc.TargetGroup, error) {
 	return tgt, nil
 }
 
-func initialize(dbp *nativeProcess) error {
+func isProcDir(name string) bool {
+	for _, ch := range name {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func waitForSearchProcess(pfx string, seen map[int]struct{}) (int, error) {
+	log := logflags.DebuggerLogger()
+	des, err := os.ReadDir("/proc")
+	if err != nil {
+		log.Errorf("error reading proc: %v", err)
+		return 0, nil
+	}
+	for _, de := range des {
+		if !de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if !isProcDir(name) {
+			continue
+		}
+		pid, _ := strconv.Atoi(name)
+		if _, isseen := seen[pid]; isseen {
+			continue
+		}
+		seen[pid] = struct{}{}
+		buf, err := os.ReadFile(filepath.Join("/proc", name, "cmdline"))
+		if err != nil {
+			// probably we just don't have permissions
+			continue
+		}
+		for i := range buf {
+			if buf[i] == 0 {
+				buf[i] = ' '
+			}
+		}
+		log.Debugf("waitfor: new process %q", string(buf))
+		if strings.HasPrefix(string(buf), pfx) {
+			return pid, nil
+		}
+	}
+	return 0, nil
+}
+
+func initialize(dbp *nativeProcess) (string, error) {
 	comm, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/comm", dbp.pid))
 	if err == nil {
 		// removes newline character
@@ -179,22 +235,22 @@ func initialize(dbp *nativeProcess) error {
 	if comm == nil || len(comm) <= 0 {
 		stat, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/stat", dbp.pid))
 		if err != nil {
-			return fmt.Errorf("could not read proc stat: %v", err)
+			return "", fmt.Errorf("could not read proc stat: %v", err)
 		}
 		expr := fmt.Sprintf("%d\\s*\\((.*)\\)", dbp.pid)
 		rexp, err := regexp.Compile(expr)
 		if err != nil {
-			return fmt.Errorf("regexp compile error: %v", err)
+			return "", fmt.Errorf("regexp compile error: %v", err)
 		}
 		match := rexp.FindSubmatch(stat)
 		if match == nil {
-			return fmt.Errorf("no match found using regexp '%s' in /proc/%d/stat", expr, dbp.pid)
+			return "", fmt.Errorf("no match found using regexp '%s' in /proc/%d/stat", expr, dbp.pid)
 		}
 		comm = match[1]
 	}
 	dbp.os.comm = strings.ReplaceAll(string(comm), "%", "%%")
 
-	return nil
+	return getCmdLine(dbp.pid), nil
 }
 
 func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
@@ -205,7 +261,7 @@ func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
 }
 
 // kill kills the target process.
-func (dbp *nativeProcess) kill() error {
+func (procgrp *processGroup) kill(dbp *nativeProcess) error {
 	if dbp.exited {
 		return nil
 	}
@@ -460,21 +516,24 @@ func trapWaitInternal(procgrp *processGroup, pid int, options trapWaitOptions) (
 			}
 			dbp = newChildProcess(procgrp.procs[0], wpid)
 			dbp.followExec = true
-			dbp.initializeBasic()
-			_, err := procgrp.add(dbp, dbp.pid, dbp.memthread, findExecutable("", dbp.pid), proc.StopLaunched)
+			cmdline, _ := dbp.initializeBasic()
+			tgt, err := procgrp.add(dbp, dbp.pid, dbp.memthread, findExecutable("", dbp.pid), proc.StopLaunched, cmdline)
 			if err != nil {
-				_ = dbp.Detach(false)
 				return nil, err
 			}
 			if halt {
 				return nil, nil
 			}
-			// TODO(aarzilli): if we want to give users the ability to stop the target
-			// group on exec here is where we should return
-			err = dbp.threads[dbp.pid].Continue()
-			if err != nil {
-				return nil, err
+			if tgt != nil {
+				// If tgt is nil we decided we are not interested in debugging this
+				// process, and we have already detached from it.
+				err = dbp.threads[dbp.pid].Continue()
+				if err != nil {
+					return nil, err
+				}
 			}
+			//TODO(aarzilli): if we want to give users the ability to stop the target
+			//group on exec here is where we should return
 			continue
 		}
 		if th == nil {
@@ -588,20 +647,28 @@ func exitGuard(dbp *nativeProcess, procgrp *processGroup, err error) error {
 	return err
 }
 
-func (dbp *nativeProcess) resume() error {
+func (procgrp *processGroup) resume() error {
 	// all threads stopped over a breakpoint are made to step over it
-	for _, thread := range dbp.threads {
-		if thread.CurrentBreakpoint.Breakpoint != nil {
-			if err := thread.StepInstruction(); err != nil {
-				return err
+	for _, dbp := range procgrp.procs {
+		if valid, _ := dbp.Valid(); valid {
+			for _, thread := range dbp.threads {
+				if thread.CurrentBreakpoint.Breakpoint != nil {
+					if err := thread.StepInstruction(); err != nil {
+						return err
+					}
+					thread.CurrentBreakpoint.Clear()
+				}
 			}
-			thread.CurrentBreakpoint.Clear()
 		}
 	}
 	// everything is resumed
-	for _, thread := range dbp.threads {
-		if err := thread.resume(); err != nil && err != sys.ESRCH {
-			return err
+	for _, dbp := range procgrp.procs {
+		if valid, _ := dbp.Valid(); valid {
+			for _, thread := range dbp.threads {
+				if err := thread.resume(); err != nil && err != sys.ESRCH {
+					return err
+				}
+			}
 		}
 	}
 	return nil
@@ -827,10 +894,11 @@ func (dbp *nativeProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf
 		return errors.New("too many arguments in traced function, max is 12 input+return")
 	}
 
-	fn, ok := dbp.bi.LookupFunc[fnName]
-	if !ok {
+	fns := dbp.bi.LookupFunc()[fnName]
+	if len(fns) != 1 {
 		return fmt.Errorf("could not find function: %s", fnName)
 	}
+	fn := fns[0]
 
 	offset, err := dbp.BinInfo().GStructOffset(dbp.Memory())
 	if err != nil {
@@ -915,4 +983,18 @@ func (dbp *nativeProcess) FollowExec(v bool) error {
 
 func killProcess(pid int) error {
 	return sys.Kill(pid, sys.SIGINT)
+}
+
+func getCmdLine(pid int) string {
+	buf, _ := ioutil.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	args := strings.SplitN(string(buf), "\x00", -1)
+	for i := range args {
+		if strings.Contains(args[i], " ") {
+			args[i] = strconv.Quote(args[i])
+		}
+	}
+	if len(args) > 0 && args[len(args)-1] == "" {
+		args = args[:len(args)-1]
+	}
+	return strings.Join(args, " ")
 }

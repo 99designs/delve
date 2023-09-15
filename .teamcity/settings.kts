@@ -35,26 +35,27 @@ To debug in IntelliJ Idea, open the 'Maven Projects' tool window (View
 version = "2020.2"
 
 val targets = arrayOf(
-        "linux/amd64/1.18",
         "linux/amd64/1.19",
         "linux/amd64/1.20",
+        "linux/amd64/1.21",
         "linux/amd64/tip",
 
         "linux/386/1.20",
 
-        "linux/arm64/1.20",
+        "linux/arm64/1.21",
         "linux/arm64/tip",
 
-        "windows/amd64/1.20",
+        "linux/ppc64le/1.21",
+
+        "windows/amd64/1.21",
         "windows/amd64/tip",
 
-        "windows/arm64/1.20",
-        "windows/arm64/tip",
+        "windows/arm64/1.21",
 
-        "mac/amd64/1.20",
+        "mac/amd64/1.21",
         "mac/amd64/tip",
 
-        "mac/arm64/1.20",
+        "mac/arm64/1.21",
         "mac/arm64/tip"
 )
 
@@ -176,6 +177,12 @@ class TestBuild(val os: String, val arch: String, version: String, buildId: Abso
                         arch
                     }
                 }
+                val dockerPlatformArch = when (arch) {
+                    "arm64" -> "arm64/v8"
+                    else -> {
+                        dockerArch
+                    }
+                }
                 dockerCommand {
                     name = "Pull Ubuntu"
                     commandType = other {
@@ -192,6 +199,7 @@ class TestBuild(val os: String, val arch: String, version: String, buildId: Abso
                         --env TEAMCITY_VERSION=${'$'}TEAMCITY_VERSION
                         --env CI=true
                         --privileged
+                        --platform linux/$dockerPlatformArch
                         $dockerArch/ubuntu:20.04
                         /delve/_scripts/test_linux.sh ${"go$version"} $arch
                     """.trimIndent()
@@ -221,6 +229,7 @@ class TestBuild(val os: String, val arch: String, version: String, buildId: Abso
         when (arch) {
             "386", "amd64" -> equals("teamcity.agent.jvm.os.arch", if (os == "mac") "x86_64" else "amd64")
             "arm64" -> equals("teamcity.agent.jvm.os.arch", "aarch64")
+            "ppc64le" -> equals("teamcity.agent.jvm.os.arch", "ppc64le")
         }
         when (os) {
             "linux" -> {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/constant"
 	"io/ioutil"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -45,9 +46,14 @@ func matchStringOrPrefix(output, target string) bool {
 		prefix := target[:len(target)-len("…")]
 		b := strings.HasPrefix(output, prefix)
 		return b
-	} else {
-		return output == target
 	}
+
+	if strings.HasPrefix(target, "/") && strings.HasSuffix(target, "/") {
+		rx := regexp.MustCompile(target[1 : len(target)-1])
+		return rx.MatchString(output)
+	}
+
+	return output == target
 }
 
 func assertVariable(t testing.TB, variable *proc.Variable, expected varTest) {
@@ -76,7 +82,7 @@ func evalScope(p *proc.Target) (*proc.EvalScope, error) {
 	if err != nil {
 		return nil, err
 	}
-	return proc.FrameToScope(p, p.Memory(), nil, frame), nil
+	return proc.FrameToScope(p, p.Memory(), nil, p.CurrentThread().ThreadID(), frame), nil
 }
 
 func evalVariableWithCfg(p *proc.Target, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
@@ -212,7 +218,7 @@ func TestSetVariable(t *testing.T) {
 			assertNoError(err, t, "EvalVariable()")
 			assertVariable(t, variable, varTest{tc.name, true, tc.startVal, "", tc.typ, nil})
 
-			assertNoError(setVariable(p, tc.name, tc.expr), t, "SetVariable()")
+			assertNoError(setVariable(p, tc.name, tc.expr), t, fmt.Sprintf("SetVariable(%q, %q)", tc.name, tc.expr))
 
 			variable, err = evalVariableWithCfg(p, tc.name, pnormalLoadConfig)
 			assertNoError(err, t, "EvalVariable()")
@@ -309,7 +315,7 @@ func TestMultilineVariableEvaluation(t *testing.T) {
 		{"a4", true, "[2]int [1,2]", "", "[2]int", nil},
 		{"a5", true, "[]int len: 5, cap: 5, [1,2,3,4,5]", "", "[]int", nil},
 		{"a6", true, "main.FooBar {Baz: 8, Bur: \"word\"}", "", "main.FooBar", nil},
-		{"a7", true, "*main.FooBar {Baz: 5, Bur: \"strum\"}", "", "*main.FooBar", nil},
+		{"a7", true, `/^\(\*main\.FooBar\)\(.*?\)\n\*main\.FooBar \{Baz: 5, Bur: "strum"\}$/`, "", "*main.FooBar", nil},
 		{"a8", true, "main.FooBar2 {Bur: 10, Baz: \"feh\"}", "", "main.FooBar2", nil},
 		{"a9", true, "*main.FooBar nil", "", "*main.FooBar", nil},
 		{"a8", true, "main.FooBar2 {Bur: 10, Baz: \"feh\"}", "", "main.FooBar2", nil}, // reread variable after member
@@ -331,7 +337,7 @@ func TestMultilineVariableEvaluation(t *testing.T) {
 			variable, err := evalVariableWithCfg(p, tc.name, pnormalLoadConfig)
 			assertNoError(err, t, "EvalVariable() returned an error")
 			if ms := api.ConvertVar(variable).MultilineString("", ""); !matchStringOrPrefix(ms, tc.value) {
-				t.Fatalf("Expected %s got %s (variable %s)\n", tc.value, ms, variable.Name)
+				t.Fatalf("Expected %s got %q (variable %s)\n", tc.value, ms, variable.Name)
 			}
 		}
 	})
@@ -411,7 +417,7 @@ func TestLocalVariables(t *testing.T) {
 				var frame proc.Stackframe
 				frame, err = findFirstNonRuntimeFrame(p)
 				if err == nil {
-					scope = proc.FrameToScope(p, p.Memory(), nil, frame)
+					scope = proc.FrameToScope(p, p.Memory(), nil, p.CurrentThread().ThreadID(), frame)
 				}
 			} else {
 				scope, err = proc.GoroutineScope(p, p.CurrentThread())
@@ -500,7 +506,7 @@ func TestComplexSetting(t *testing.T) {
 			variable, err := evalVariableWithCfg(p, "c128", pnormalLoadConfig)
 			assertNoError(err, t, "EvalVariable()")
 			if s := api.ConvertVar(variable).SinglelineString(); s != value {
-				t.Fatalf("Wrong value of c128: \"%s\", expected \"%s\" after setting it to \"%s\"", s, value, setExpr)
+				t.Fatalf("Wrong value of c128: %q, expected %q after setting it to %q", s, value, setExpr)
 			}
 		}
 
@@ -558,6 +564,7 @@ func getEvalExpressionTestCases() []varTest {
 		{"ch1", true, "chan int 4/11", "chan int 4/11", "chan int", nil},
 		{"chnil", true, "chan int nil", "chan int nil", "chan int", nil},
 		{"ch1+1", false, "", "", "", fmt.Errorf("can not convert 1 constant to chan int")},
+		{"int3chan.buf", false, "*[5]main.ThreeInts [{a: 1, b: 0, c: 0},{a: 2, b: 0, c: 0},{a: 3, b: 0, c: 0},{a: 0, b: 0, c: 0},{a: 0, b: 0, c: 0}]", "(*[5]main.ThreeInts)(…", "*[5]main.ThreeInts", nil},
 
 		// maps
 		{"m1[\"Malone\"]", false, "main.astruct {A: 2, B: 3}", "main.astruct {A: 2, B: 3}", "main.astruct", nil},
@@ -740,6 +747,8 @@ func getEvalExpressionTestCases() []varTest {
 		{"emptymap", false, `map[string]string []`, `map[string]string []`, "map[string]string", nil},
 		{"mnil", false, `map[string]main.astruct nil`, `map[string]main.astruct nil`, "map[string]main.astruct", nil},
 
+		{"ptrinf2", false, `**(main.pptr)(…`, `(main.pptr)(…`, "main.pptr", nil},
+
 		// conversions between string/[]byte/[]rune (issue #548)
 		{"runeslice", true, `[]int32 len: 4, cap: 4, [116,232,115,116]`, `[]int32 len: 4, cap: 4, [...]`, "[]int32", nil},
 		{"byteslice", true, `[]uint8 len: 5, cap: 5, [116,195,168,115,116]`, `[]uint8 len: 5, cap: 5, [...]`, "[]uint8", nil},
@@ -770,9 +779,9 @@ func getEvalExpressionTestCases() []varTest {
 		{"main.afunc2", true, `main.afunc2`, `main.afunc2`, `func()`, nil},
 
 		{"s2[0].Error", false, "main.(*astruct).Error", "main.(*astruct).Error", "func() string", nil},
-		{"s2[0].NonPointerRecieverMethod", false, "main.astruct.NonPointerRecieverMethod", "main.astruct.NonPointerRecieverMethod", "func()", nil},
+		{"s2[0].NonPointerReceiverMethod", false, "main.astruct.NonPointerReceiverMethod", "main.astruct.NonPointerReceiverMethod", "func()", nil},
 		{"as2.Error", false, "main.(*astruct).Error", "main.(*astruct).Error", "func() string", nil},
-		{"as2.NonPointerRecieverMethod", false, "main.astruct.NonPointerRecieverMethod", "main.astruct.NonPointerRecieverMethod", "func()", nil},
+		{"as2.NonPointerReceiverMethod", false, "main.astruct.NonPointerReceiverMethod", "main.astruct.NonPointerReceiverMethod", "func()", nil},
 
 		{`iface2map.(data)`, false, "…", "…", "map[string]interface {}", nil},
 
@@ -855,6 +864,7 @@ func TestEvalExpression(t *testing.T) {
 		assertNoError(grp.Continue(), t, "Continue() returned an error")
 		for i, tc := range testcases {
 			t.Run(strconv.Itoa(i), func(t *testing.T) {
+				t.Logf("%q", tc.name)
 				variable, err := evalVariableWithCfg(p, tc.name, pnormalLoadConfig)
 				if err != nil && err.Error() == "evaluating methods not supported on this version of Go" {
 					// this type of eval is unsupported with the current version of Go.
@@ -888,7 +898,7 @@ func TestEvalAddrAndCast(t *testing.T) {
 		c1addrstr := api.ConvertVar(c1addr).SinglelineString()
 		t.Logf("&c1 → %s", c1addrstr)
 		if !strings.HasPrefix(c1addrstr, "(*main.cstruct)(0x") {
-			t.Fatalf("Invalid value of EvalExpression(&c1) \"%s\"", c1addrstr)
+			t.Fatalf("Invalid value of EvalExpression(&c1) %q", c1addrstr)
 		}
 
 		aaddr, err := evalVariableWithCfg(p, "&(c1.pb.a)", pnormalLoadConfig)
@@ -896,7 +906,7 @@ func TestEvalAddrAndCast(t *testing.T) {
 		aaddrstr := api.ConvertVar(aaddr).SinglelineString()
 		t.Logf("&(c1.pb.a) → %s", aaddrstr)
 		if !strings.HasPrefix(aaddrstr, "(*main.astruct)(0x") {
-			t.Fatalf("invalid value of EvalExpression(&(c1.pb.a)) \"%s\"", aaddrstr)
+			t.Fatalf("invalid value of EvalExpression(&(c1.pb.a)) %q", aaddrstr)
 		}
 
 		a, err := evalVariableWithCfg(p, "*"+aaddrstr, pnormalLoadConfig)
@@ -1094,16 +1104,16 @@ func TestPackageRenames(t *testing.T) {
 
 func TestConstants(t *testing.T) {
 	testcases := []varTest{
-		{"a", true, "constTwo (2)", "", "main.ConstType", nil},
-		{"b", true, "constThree (3)", "", "main.ConstType", nil},
-		{"c", true, "bitZero|bitOne (3)", "", "main.BitFieldType", nil},
-		{"d", true, "33", "", "main.BitFieldType", nil},
-		{"e", true, "10", "", "main.ConstType", nil},
-		{"f", true, "0", "", "main.BitFieldType", nil},
-		{"bitZero", true, "1", "", "main.BitFieldType", nil},
-		{"bitOne", true, "2", "", "main.BitFieldType", nil},
-		{"constTwo", true, "2", "", "main.ConstType", nil},
-		{"pkg.SomeConst", false, "2", "", "int", nil},
+		{"a", true, "constTwo (2)", "0x2", "main.ConstType", nil},
+		{"b", true, "constThree (3)", "0x3", "main.ConstType", nil},
+		{"c", true, "bitZero|bitOne (3)", "0x3", "main.BitFieldType", nil},
+		{"d", true, "33", "0x21", "main.BitFieldType", nil},
+		{"e", true, "10", "0xa", "main.ConstType", nil},
+		{"f", true, "0", "0x0", "main.BitFieldType", nil},
+		{"bitZero", true, "1", "0x1", "main.BitFieldType", nil},
+		{"bitOne", true, "2", "0x2", "main.BitFieldType", nil},
+		{"constTwo", true, "2", "0x2", "main.ConstType", nil},
+		{"pkg.SomeConst", false, "2", "0x2", "int", nil},
 	}
 	ver, _ := goversion.Parse(runtime.Version())
 	if ver.Major > 0 && !ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 10, Rev: -1}) {
@@ -1116,6 +1126,11 @@ func TestConstants(t *testing.T) {
 			variable, err := evalVariableWithCfg(p, testcase.name, pnormalLoadConfig)
 			assertNoError(err, t, fmt.Sprintf("EvalVariable(%s)", testcase.name))
 			assertVariable(t, variable, testcase)
+			cv := api.ConvertVar(variable)
+			str := cv.SinglelineStringFormatted("%#x")
+			if str != testcase.alternate {
+				t.Errorf("for %s expected %q got %q when formatting in hexadecimal", testcase.name, testcase.alternate, str)
+			}
 		}
 	})
 }
@@ -1265,6 +1280,7 @@ func TestCallFunction(t *testing.T) {
 		{`regabistacktest("one", "two", "three", "four", "five", 4)`, []string{`:string:"onetwo"`, `:string:"twothree"`, `:string:"threefour"`, `:string:"fourfive"`, `:string:"fiveone"`, ":uint8:8"}, nil},
 		{`regabistacktest2(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)`, []string{":int:3", ":int:5", ":int:7", ":int:9", ":int:11", ":int:13", ":int:15", ":int:17", ":int:19", ":int:11"}, nil},
 		{`issue2698.String()`, []string{`:string:"1 2 3 4"`}, nil},
+		{`issue3364.String()`, []string{`:string:"1 2"`}, nil},
 		{`regabistacktest3(rast3, 5)`, []string{`:[10]string:[10]string ["onetwo","twothree","threefour","fourfive","fivesix","sixseven","sevenheight","heightnine","nineten","tenone"]`, ":uint8:15"}, nil},
 		{`floatsum(1, 2)`, []string{":float64:3"}, nil},
 	}
@@ -1459,6 +1475,7 @@ func assertCurrentLocationFunction(p *proc.Target, t *testing.T, fnname string) 
 }
 
 func TestPluginVariables(t *testing.T) {
+	skipOn(t, "broken", "ppc64le")
 	pluginFixtures := protest.WithPlugins(t, protest.AllNonOptimized, "plugin1/", "plugin2/")
 
 	withTestProcessArgs("plugintest2", t, ".", []string{pluginFixtures[0].Path, pluginFixtures[1].Path}, protest.AllNonOptimized, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
@@ -1539,6 +1556,10 @@ func TestCgoEval(t *testing.T) {
 
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		t.Skip("cgo doesn't work on darwin/arm64")
+	}
+
+	if runtime.GOARCH == "ppc64le" {
+		t.Skip("skipped on ppc64le: broken")
 	}
 
 	protest.AllowRecording(t)
@@ -1664,11 +1685,11 @@ func TestBadUnsafePtr(t *testing.T) {
 		}
 		expErr := "couldn't read pointer"
 		if !strings.Contains(err.Error(), expErr) {
-			t.Fatalf("expected \"%s\", got: \"%s\"", expErr, err)
+			t.Fatalf("expected %q, got: %q", expErr, err)
 		}
 		nexpErr := "nil pointer dereference"
 		if strings.Contains(err.Error(), nexpErr) {
-			t.Fatalf("shouldn't have gotten \"%s\", but got: \"%s\"", nexpErr, err)
+			t.Fatalf("shouldn't have gotten %q, but got: %q", nexpErr, err)
 		}
 	})
 }

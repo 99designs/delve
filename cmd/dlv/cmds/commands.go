@@ -14,11 +14,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/go-delve/delve/cmd/dlv/cmds/helphelpers"
 	"github.com/go-delve/delve/pkg/config"
 	"github.com/go-delve/delve/pkg/gobuild"
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/logflags"
+	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/terminal"
 	"github.com/go-delve/delve/pkg/version"
 	"github.com/go-delve/delve/service"
@@ -78,11 +81,12 @@ var (
 	// rootCommand is the root of the command tree.
 	rootCommand *cobra.Command
 
-	traceAttachPid  int
-	traceExecFile   string
-	traceTestBinary bool
-	traceStackDepth int
-	traceUseEBPF    bool
+	traceAttachPid     int
+	traceExecFile      string
+	traceTestBinary    bool
+	traceStackDepth    int
+	traceUseEBPF       bool
+	traceShowTimestamp bool
 
 	// redirect specifications for target process
 	redirects []string
@@ -93,6 +97,10 @@ var (
 	loadConfErr error
 
 	rrOnProcessPid int
+
+	attachWaitFor         string
+	attachWaitForInterval float64
+	attachWaitForDuration float64
 )
 
 const dlvCommandLongDesc = `Delve is a source level debugger for Go programs.
@@ -159,7 +167,7 @@ begin a new debug session.  When exiting the debug session you will have the
 option to let the process continue or kill it.
 `,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
+			if len(args) == 0 && attachWaitFor == "" {
 				return errors.New("you must provide a PID")
 			}
 			return nil
@@ -167,6 +175,9 @@ option to let the process continue or kill it.
 		Run: attachCmd,
 	}
 	attachCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
+	attachCommand.Flags().StringVar(&attachWaitFor, "waitfor", "", "Wait for a process with a name beginning with this prefix")
+	attachCommand.Flags().Float64Var(&attachWaitForInterval, "waitfor-interval", 1, "Interval between checks of the process list, in millisecond")
+	attachCommand.Flags().Float64Var(&attachWaitForDuration, "waitfor-duration", 0, "Total time to wait for a process")
 	rootCommand.AddCommand(attachCommand)
 
 	// 'connect' subcommand.
@@ -228,7 +239,7 @@ package name and Delve will compile that package instead, and begin a new debug
 session.`,
 		Run: debugCmd,
 	}
-	debugCommand.Flags().String("output", "./__debug_bin", "Output path for the binary.")
+	debugCommand.Flags().String("output", "", "Output path for the binary.")
 	debugCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	debugCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
 	rootCommand.AddCommand(debugCommand)
@@ -266,6 +277,7 @@ or later, -gcflags="-N -l" on earlier versions of Go.`,
 			fmt.Println("This command is deprecated, please use 'debug' instead.")
 			os.Exit(0)
 		},
+		Hidden: true,
 	}
 	rootCommand.AddCommand(runCommand)
 
@@ -285,7 +297,7 @@ dlv test [package] -- -test.run TestSomething -test.v -other-argument
 See also: 'go help testflag'.`,
 		Run: testCmd,
 	}
-	testCommand.Flags().String("output", "debug.test", "Output path for the binary.")
+	testCommand.Flags().String("output", "", "Output path for the binary.")
 	rootCommand.AddCommand(testCommand)
 
 	// 'trace' subcommand.
@@ -301,14 +313,17 @@ to know what functions your process is executing.
 
 The output of the trace sub command is printed to stderr, so if you would like to
 only see the output of the trace operations you can redirect stdout.`,
-		Run: traceCmd,
+		Run: func(cmd *cobra.Command, args []string) {
+			os.Exit(traceCmd(cmd, args, conf))
+		},
 	}
 	traceCommand.Flags().IntVarP(&traceAttachPid, "pid", "p", 0, "Pid to attach to.")
 	traceCommand.Flags().StringVarP(&traceExecFile, "exec", "e", "", "Binary file to exec and trace.")
 	traceCommand.Flags().BoolVarP(&traceTestBinary, "test", "t", false, "Trace a test binary.")
 	traceCommand.Flags().BoolVarP(&traceUseEBPF, "ebpf", "", false, "Trace using eBPF (experimental).")
+	traceCommand.Flags().BoolVarP(&traceShowTimestamp, "timestamp", "", false, "Show timestamp in the output")
 	traceCommand.Flags().IntVarP(&traceStackDepth, "stack", "s", 0, "Show stack trace with given depth. (Ignored with --ebpf)")
-	traceCommand.Flags().String("output", "debug", "Output path for the binary.")
+	traceCommand.Flags().String("output", "", "Output path for the binary.")
 	rootCommand.AddCommand(traceCommand)
 
 	coreCommand := &cobra.Command{
@@ -408,6 +423,7 @@ names selected from this list:
 	dap		Log all DAP messages
 	fncall		Log function call protocol
 	minidump	Log minidump loading
+	stack           Log stacktracer
 
 Additionally --log-dest can be used to specify where the logs should be
 written. 
@@ -437,6 +453,8 @@ File redirects can also be changed using the 'restart' command.
 	})
 
 	rootCommand.DisableAutoGenTag = true
+
+	configUsageFunc(rootCommand)
 
 	return rootCommand
 }
@@ -525,10 +543,21 @@ func dapCmd(cmd *cobra.Command, args []string) {
 }
 
 func buildBinary(cmd *cobra.Command, args []string, isTest bool) (string, bool) {
-	debugname, err := filepath.Abs(cmd.Flag("output").Value.String())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		return "", false
+	outputFlag := cmd.Flag("output").Value.String()
+	var debugname string
+	var err error
+	if outputFlag == "" {
+		if isTest {
+			debugname = gobuild.DefaultDebugBinaryPath("debug.test")
+		} else {
+			debugname = gobuild.DefaultDebugBinaryPath("__debug_bin")
+		}
+	} else {
+		debugname, err = filepath.Abs(outputFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return "", false
+		}
 	}
 
 	if isTest {
@@ -537,6 +566,9 @@ func buildBinary(cmd *cobra.Command, args []string, isTest bool) (string, bool) 
 		err = gobuild.GoBuild(debugname, args, buildFlags)
 	}
 	if err != nil {
+		if outputFlag == "" {
+			gobuild.Remove(debugname)
+		}
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return "", false
 	}
@@ -557,7 +589,7 @@ func debugCmd(cmd *cobra.Command, args []string) {
 	os.Exit(status)
 }
 
-func traceCmd(cmd *cobra.Command, args []string) {
+func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 	status := func() int {
 		err := logflags.Setup(log, logOutput, logDest)
 		defer logflags.Close()
@@ -627,10 +659,11 @@ func traceCmd(cmd *cobra.Command, args []string) {
 			ProcessArgs: processArgs,
 			APIVersion:  2,
 			Debugger: debugger.Config{
-				AttachPid:      traceAttachPid,
-				WorkingDir:     workingDir,
-				Backend:        backend,
-				CheckGoVersion: checkGoVersion,
+				AttachPid:            traceAttachPid,
+				WorkingDir:           workingDir,
+				Backend:              backend,
+				CheckGoVersion:       checkGoVersion,
+				DebugInfoDirectories: conf.DebugInfoDirectories,
 			},
 		})
 		if err := server.Run(); err != nil {
@@ -639,6 +672,15 @@ func traceCmd(cmd *cobra.Command, args []string) {
 		}
 		client := rpc2.NewClientFromConn(clientConn)
 		defer client.Detach(true)
+
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT)
+
+		go func() {
+			<-ch
+			client.Halt()
+		}()
+
 		funcs, err := client.ListFunctions(regexp)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -694,7 +736,10 @@ func traceCmd(cmd *cobra.Command, args []string) {
 			return 1
 		}
 		cmds := terminal.DebugCommands(client)
-		t := terminal.New(client, nil)
+		cfg := &config.Config{
+			TraceShowTimestamp: traceShowTimestamp,
+		}
+		t := terminal.New(client, cfg)
 		t.SetTraceNonInteractive()
 		t.RedirectTo(os.Stderr)
 		defer t.Close()
@@ -723,6 +768,11 @@ func traceCmd(cmd *cobra.Command, args []string) {
 									params.WriteString(p.Value)
 								}
 							}
+
+							if traceShowTimestamp {
+								fmt.Fprintf(os.Stderr, "%s ", time.Now().Format(time.RFC3339Nano))
+							}
+
 							if t.IsRet {
 								for _, p := range t.ReturnParams {
 									fmt.Fprintf(os.Stderr, "=> %#v\n", p.Value)
@@ -744,7 +794,7 @@ func traceCmd(cmd *cobra.Command, args []string) {
 		}
 		return 0
 	}()
-	os.Exit(status)
+	return status
 }
 
 func isBreakpointExistsErr(err error) bool {
@@ -789,12 +839,17 @@ func getPackageDir(pkg []string) string {
 }
 
 func attachCmd(cmd *cobra.Command, args []string) {
-	pid, err := strconv.Atoi(args[0])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid pid: %s\n", args[0])
-		os.Exit(1)
+	var pid int
+	if len(args) > 0 {
+		var err error
+		pid, err = strconv.Atoi(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid pid: %s\n", args[0])
+			os.Exit(1)
+		}
+		args = args[1:]
 	}
-	os.Exit(execute(pid, args[1:], conf, "", debugger.ExecutingOther, args, buildFlags))
+	os.Exit(execute(pid, args, conf, "", debugger.ExecutingOther, args, buildFlags))
 }
 
 func coreCmd(cmd *cobra.Command, args []string) {
@@ -807,16 +862,18 @@ func connectCmd(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 		return
 	}
-	defer logflags.Close()
 	if loadConfErr != nil {
 		logflags.DebuggerLogger().Errorf("%v", loadConfErr)
 	}
 	addr := args[0]
 	if addr == "" {
 		fmt.Fprint(os.Stderr, "An empty address was provided. You must provide an address as the first argument.\n")
+		logflags.Close()
 		os.Exit(1)
 	}
-	os.Exit(connect(addr, nil, conf, debugger.ExecutingOther))
+	ec := connect(addr, nil, conf, debugger.ExecutingOther)
+	logflags.Close()
+	os.Exit(ec)
 }
 
 // waitForDisconnectSignal is a blocking function that waits for either
@@ -974,20 +1031,25 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 			CheckLocalConnUser: checkLocalConnUser,
 			DisconnectChan:     disconnectChan,
 			Debugger: debugger.Config{
-				AttachPid:            attachPid,
-				WorkingDir:           workingDir,
-				Backend:              backend,
-				CoreFile:             coreFile,
-				Foreground:           headless && tty == "",
-				Packages:             dlvArgs,
-				BuildFlags:           buildFlags,
-				ExecuteKind:          kind,
-				DebugInfoDirectories: conf.DebugInfoDirectories,
-				CheckGoVersion:       checkGoVersion,
-				TTY:                  tty,
-				Redirects:            redirects,
-				DisableASLR:          disableASLR,
-				RrOnProcessPid:       rrOnProcessPid,
+				AttachPid:             attachPid,
+				WorkingDir:            workingDir,
+				Backend:               backend,
+				CoreFile:              coreFile,
+				Foreground:            headless && tty == "",
+				Packages:              dlvArgs,
+				BuildFlags:            buildFlags,
+				ExecuteKind:           kind,
+				DebugInfoDirectories:  conf.DebugInfoDirectories,
+				CheckGoVersion:        checkGoVersion,
+				TTY:                   tty,
+				Stdin:                 redirects[0],
+				Stdout:                proc.OutputRedirect{Path: redirects[1]},
+				Stderr:                proc.OutputRedirect{Path: redirects[2]},
+				DisableASLR:           disableASLR,
+				RrOnProcessPid:        rrOnProcessPid,
+				AttachWaitFor:         attachWaitFor,
+				AttachWaitForInterval: attachWaitForInterval,
+				AttachWaitForDuration: attachWaitForDuration,
 			},
 		})
 	default:
@@ -1049,4 +1111,20 @@ func parseRedirects(redirects []string) ([3]string, error) {
 		r[idx] = redirect
 	}
 	return r, nil
+}
+
+func configUsageFunc(cmd *cobra.Command) {
+	for _, subcmd := range cmd.Commands() {
+		configUsageFunc(subcmd)
+	}
+
+	if cmd.Run == nil && cmd.Name() != "dlv" {
+		return
+	}
+
+	usage := cmd.UsageFunc()
+	cmd.SetUsageFunc(func(cmd *cobra.Command) error {
+		helphelpers.Prepare(cmd)
+		return usage(cmd)
+	})
 }

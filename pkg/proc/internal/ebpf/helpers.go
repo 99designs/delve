@@ -18,6 +18,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 //lint:file-ignore U1000 some fields are used by the C program
@@ -60,6 +61,7 @@ type EBPFContext struct {
 	bpfRingBuf *ringbuf.Reader
 	executable *link.Executable
 	bpfArgMap  *ebpf.Map
+	links      []link.Link
 
 	parsedBpfEvents []RawUProbeParams
 	m               sync.Mutex
@@ -69,13 +71,19 @@ func (ctx *EBPFContext) Close() {
 	if ctx.objs != nil {
 		ctx.objs.Close()
 	}
+	if ctx.links != nil {
+		for _, l := range ctx.links {
+			l.Close()
+		}
+	}
 }
 
 func (ctx *EBPFContext) AttachUprobe(pid int, name string, offset uint64) error {
 	if ctx.executable == nil {
 		return errors.New("no eBPF program loaded")
 	}
-	_, err := ctx.executable.Uprobe(name, ctx.objs.tracePrograms.UprobeDlvTrace, &link.UprobeOptions{PID: pid, Offset: offset})
+	l, err := ctx.executable.Uprobe(name, ctx.objs.tracePrograms.UprobeDlvTrace, &link.UprobeOptions{PID: pid, Offset: offset})
+	ctx.links = append(ctx.links, l)
 	return err
 }
 
@@ -109,6 +117,9 @@ func LoadEBPFTracingProgram(path string) (*EBPFContext, error) {
 		objs traceObjects
 	)
 
+	if err = rlimit.RemoveMemlock(); err != nil {
+		return nil, err
+	}
 	ctx.executable, err = link.OpenExecutable(path)
 	if err != nil {
 		return nil, err
@@ -175,7 +186,9 @@ func parseFunctionParameterList(rawParamBytes []byte) RawUProbeParams {
 		iparam.Addr = FakeAddressBase
 
 		switch iparam.Kind {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			iparam.RealType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 8}}}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Bool:
 			iparam.RealType = &godwarf.IntType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 8}}}
 		case reflect.String:
 			strLen := binary.LittleEndian.Uint64(val[8:])

@@ -27,6 +27,10 @@ func replaceDocPath(s string) string {
 				break
 			}
 		}
+		// If we captured a trailing dot, backtrack.
+		if s[end-1] == '.' {
+			end--
+		}
 
 		text := s[start:end]
 		s = s[:start] + fmt.Sprintf("[%s](//github.com/go-delve/delve/tree/master/%s)", text, text) + s[end:]
@@ -34,7 +38,7 @@ func replaceDocPath(s string) string {
 	}
 }
 
-func (commands *Commands) WriteMarkdown(w io.Writer) {
+func (c *Commands) WriteMarkdown(w io.Writer) {
 	fmt.Fprint(w, "# Configuration and Command History\n\n")
 	fmt.Fprint(w, "If `$XDG_CONFIG_HOME` is set, then configuration and command history files are located in `$XDG_CONFIG_HOME/dlv`. ")
 	fmt.Fprint(w, "Otherwise, they are located in `$HOME/.config/dlv` on Linux and `$HOME/.dlv` on other systems.\n\n")
@@ -48,7 +52,7 @@ func (commands *Commands) WriteMarkdown(w io.Writer) {
 
 		fmt.Fprint(w, "Command | Description\n")
 		fmt.Fprint(w, "--------|------------\n")
-		for _, cmd := range commands.cmds {
+		for _, cmd := range c.cmds {
 			if cmd.group != cgd.group {
 				continue
 			}
@@ -62,7 +66,7 @@ func (commands *Commands) WriteMarkdown(w io.Writer) {
 
 	}
 
-	for _, cmd := range commands.cmds {
+	for _, cmd := range c.cmds {
 		fmt.Fprintf(w, "## %s\n%s\n\n", cmd.aliases[0], replaceDocPath(cmd.helpMsg))
 		if len(cmd.aliases) > 1 {
 			fmt.Fprint(w, "Aliases:")

@@ -245,8 +245,8 @@ func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
 }
 
 func TestCore(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return
+	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
+		t.Skip("unsupported")
 	}
 	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
 		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
@@ -268,7 +268,7 @@ func TestCore(t *testing.T) {
 	var panickingStack []proc.Stackframe
 	for _, g := range gs {
 		t.Logf("Goroutine %d", g.ID)
-		stack, err := g.Stacktrace(10, 0)
+		stack, err := proc.GoroutineStacktrace(p, g, 10, 0)
 		if err != nil {
 			t.Errorf("Stacktrace() on goroutine %v = %v", g, err)
 		}
@@ -299,7 +299,7 @@ func TestCore(t *testing.T) {
 	if mainFrame == nil {
 		t.Fatalf("Couldn't find main in stack %v", panickingStack)
 	}
-	msg, err := proc.FrameToScope(p, p.Memory(), nil, *mainFrame).EvalExpression("msg", proc.LoadConfig{MaxStringLen: 64})
+	msg, err := proc.FrameToScope(p, p.Memory(), nil, p.CurrentThread().ThreadID(), *mainFrame).EvalExpression("msg", proc.LoadConfig{MaxStringLen: 64})
 	if err != nil {
 		t.Fatalf("Couldn't EvalVariable(msg, ...): %v", err)
 	}
@@ -315,8 +315,11 @@ func TestCore(t *testing.T) {
 }
 
 func TestCoreFpRegisters(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return
+	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
+		t.Skip("unsupported")
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Skip("test requires amd64")
 	}
 	// in go1.10 the crash is executed on a different thread and registers are
 	// no longer available in the core dump.
@@ -334,7 +337,7 @@ func TestCoreFpRegisters(t *testing.T) {
 
 	var regs proc.Registers
 	for _, thread := range p.ThreadList() {
-		frames, err := proc.ThreadStacktrace(thread, 10)
+		frames, err := proc.ThreadStacktrace(p, thread, 10)
 		if err != nil {
 			t.Errorf("ThreadStacktrace for %x = %v", thread.ThreadID(), err)
 			continue
@@ -402,8 +405,8 @@ func TestCoreFpRegisters(t *testing.T) {
 }
 
 func TestCoreWithEmptyString(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return
+	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
+		t.Skip("unsupported")
 	}
 	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
 		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
@@ -417,7 +420,7 @@ func TestCoreWithEmptyString(t *testing.T) {
 	var mainFrame *proc.Stackframe
 mainSearch:
 	for _, g := range gs {
-		stack, err := g.Stacktrace(10, 0)
+		stack, err := proc.GoroutineStacktrace(p, g, 10, 0)
 		assertNoError(err, t, "Stacktrace()")
 		for _, frame := range stack {
 			if frame.Current.Fn != nil && frame.Current.Fn.Name == "main.main" {
@@ -431,7 +434,7 @@ mainSearch:
 		t.Fatal("could not find main.main frame")
 	}
 
-	scope := proc.FrameToScope(p, p.Memory(), nil, *mainFrame)
+	scope := proc.FrameToScope(p, p.Memory(), nil, p.CurrentThread().ThreadID(), *mainFrame)
 	loadConfig := proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
 	v1, err := scope.EvalExpression("t", loadConfig)
 	assertNoError(err, t, "EvalVariable(t)")
@@ -466,7 +469,7 @@ func TestMinidump(t *testing.T) {
 	t.Logf("%d goroutines", len(gs))
 	foundMain, foundTime := false, false
 	for _, g := range gs {
-		stack, err := g.Stacktrace(10, 0)
+		stack, err := proc.GoroutineStacktrace(p, g, 10, 0)
 		if err != nil {
 			t.Errorf("Stacktrace() on goroutine %v = %v", g, err)
 		}
@@ -504,12 +507,7 @@ func procdump(t *testing.T, exePath string) string {
 		t.Fatalf("possible error running procdump64, output: %q, error: %v", string(out), err)
 	}
 
-	dh, err := os.Open(exeDir)
-	if err != nil {
-		t.Fatalf("could not open executable file directory %q: %v", exeDir, err)
-	}
-	defer dh.Close()
-	fis, err := dh.Readdir(-1)
+	fis, err := os.ReadDir(exeDir)
 	if err != nil {
 		t.Fatalf("could not read executable file directory %q: %v", exeDir, err)
 	}

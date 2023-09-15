@@ -20,7 +20,7 @@ const maxFindLocationCandidates = 5
 // LocationSpec is an interface that represents a parsed location spec string.
 type LocationSpec interface {
 	// Find returns all locations that match the location spec.
-	Find(t *proc.Target, processArgs []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, error)
+	Find(t *proc.Target, processArgs []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, string, error)
 }
 
 // NormalLocationSpec represents a basic location spec.
@@ -69,10 +69,10 @@ func Parse(locStr string) (LocationSpec, error) {
 
 	malformed := func(reason string) error {
 		//lint:ignore ST1005 backwards compatibility
-		return fmt.Errorf("Malformed breakpoint location \"%s\" at %d: %s", locStr, len(locStr)-len(rest), reason)
+		return fmt.Errorf("Malformed breakpoint location %q at %d: %s", locStr, len(locStr)-len(rest), reason)
 	}
 
-	if len(rest) <= 0 {
+	if len(rest) == 0 {
 		return nil, malformed("empty string")
 	}
 
@@ -109,7 +109,7 @@ func Parse(locStr string) (LocationSpec, error) {
 func parseLocationSpecDefault(locStr, rest string) (LocationSpec, error) {
 	malformed := func(reason string) error {
 		//lint:ignore ST1005 backwards compatibility
-		return fmt.Errorf("Malformed breakpoint location \"%s\" at %d: %s", locStr, len(locStr)-len(rest), reason)
+		return fmt.Errorf("Malformed breakpoint location %q at %d: %s", locStr, len(locStr)-len(rest), reason)
 	}
 
 	v := strings.Split(rest, ":")
@@ -269,15 +269,15 @@ func packageMatch(specPkg, symPkg string, packageMap map[string][]string) bool {
 
 // Find will search all functions in the target program and filter them via the
 // regex location spec. Only functions matching the regex will be returned.
-func (loc *RegexLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, error) {
+func (loc *RegexLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, string, error) {
 	if scope == nil {
 		//TODO(aarzilli): this needs only the list of function we should make it work
-		return nil, fmt.Errorf("could not determine location (scope is nil)")
+		return nil, "", fmt.Errorf("could not determine location (scope is nil)")
 	}
 	funcs := scope.BinInfo.Functions
 	matches, err := regexFilterFuncs(loc.FuncRegex, funcs)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	r := make([]api.Location, 0, len(matches))
 	for i := range matches {
@@ -286,39 +286,39 @@ func (loc *RegexLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalS
 			r = append(r, addressesToLocation(addrs))
 		}
 	}
-	return r, nil
+	return r, "", nil
 }
 
 // Find returns the locations specified via the address location spec.
-func (loc *AddrLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, error) {
+func (loc *AddrLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, string, error) {
 	if scope == nil {
 		addr, err := strconv.ParseInt(loc.AddrExpr, 0, 64)
 		if err != nil {
-			return nil, fmt.Errorf("could not determine current location (scope is nil)")
+			return nil, "", fmt.Errorf("could not determine current location (scope is nil)")
 		}
-		return []api.Location{{PC: uint64(addr)}}, nil
+		return []api.Location{{PC: uint64(addr)}}, "", nil
 	}
 
 	v, err := scope.EvalExpression(loc.AddrExpr, proc.LoadConfig{FollowPointers: true})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if v.Unreadable != nil {
-		return nil, v.Unreadable
+		return nil, "", v.Unreadable
 	}
 	switch v.Kind {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		addr, _ := constant.Uint64Val(v.Value)
-		return []api.Location{{PC: addr}}, nil
+		return []api.Location{{PC: addr}}, "", nil
 	case reflect.Func:
 		fn := scope.BinInfo.PCToFunc(uint64(v.Base))
 		pc, err := proc.FirstPCAfterPrologue(t, fn, false)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return []api.Location{{PC: pc}}, nil
+		return []api.Location{{PC: pc}}, v.Name, nil
 	default:
-		return nil, fmt.Errorf("wrong expression kind: %v", v.Kind)
+		return nil, "", fmt.Errorf("wrong expression kind: %v", v.Kind)
 	}
 }
 
@@ -365,13 +365,13 @@ func (ale AmbiguousLocationError) Error() string {
 	} else {
 		candidates = ale.CandidatesString
 	}
-	return fmt.Sprintf("Location \"%s\" ambiguous: %s…", ale.Location, strings.Join(candidates, ", "))
+	return fmt.Sprintf("Location %q ambiguous: %s…", ale.Location, strings.Join(candidates, ", "))
 }
 
 // Find will return a list of locations that match the given location spec.
 // This matches each other location spec that does not already have its own spec
 // implemented (such as regex, or addr).
-func (loc *NormalLocationSpec) Find(t *proc.Target, processArgs []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, error) {
+func (loc *NormalLocationSpec) Find(t *proc.Target, processArgs []string, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, string, error) {
 	limit := maxFindLocationCandidates
 	var candidateFiles []string
 	for _, sourceFile := range t.BinInfo().Sources {
@@ -396,19 +396,19 @@ func (loc *NormalLocationSpec) Find(t *proc.Target, processArgs []string, scope 
 
 	if matching := len(candidateFiles) + len(candidateFuncs); matching == 0 {
 		if scope == nil {
-			return nil, fmt.Errorf("location \"%s\" not found", locStr)
+			return nil, "", fmt.Errorf("location %q not found", locStr)
 		}
 		// if no result was found this locations string could be an
 		// expression that the user forgot to prefix with '*', try treating it as
 		// such.
 		addrSpec := &AddrLocationSpec{AddrExpr: locStr}
-		locs, err := addrSpec.Find(t, processArgs, scope, locStr, includeNonExecutableLines, nil)
+		locs, subst, err := addrSpec.Find(t, processArgs, scope, locStr, includeNonExecutableLines, nil)
 		if err != nil {
-			return nil, fmt.Errorf("location \"%s\" not found", locStr)
+			return nil, "", fmt.Errorf("location %q not found", locStr)
 		}
-		return locs, nil
+		return locs, subst, nil
 	} else if matching > 1 {
-		return nil, AmbiguousLocationError{Location: locStr, CandidatesString: append(candidateFiles, candidateFuncs...)}
+		return nil, "", AmbiguousLocationError{Location: locStr, CandidatesString: append(candidateFiles, candidateFuncs...)}
 	}
 
 	// len(candidateFiles) + len(candidateFuncs) == 1
@@ -417,12 +417,12 @@ func (loc *NormalLocationSpec) Find(t *proc.Target, processArgs []string, scope 
 	if len(candidateFiles) == 1 {
 		if loc.LineOffset < 0 {
 			//lint:ignore ST1005 backwards compatibility
-			return nil, fmt.Errorf("Malformed breakpoint location, no line offset specified")
+			return nil, "", fmt.Errorf("Malformed breakpoint location, no line offset specified")
 		}
 		addrs, err = proc.FindFileLocation(t, candidateFiles[0], loc.LineOffset)
 		if includeNonExecutableLines {
 			if _, isCouldNotFindLine := err.(*proc.ErrCouldNotFindLine); isCouldNotFindLine {
-				return []api.Location{{File: candidateFiles[0], Line: loc.LineOffset}}, nil
+				return []api.Location{{File: candidateFiles[0], Line: loc.LineOffset}}, "", nil
 			}
 		}
 	} else { // len(candidateFuncs) == 1
@@ -430,9 +430,9 @@ func (loc *NormalLocationSpec) Find(t *proc.Target, processArgs []string, scope 
 	}
 
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return []api.Location{addressesToLocation(addrs)}, nil
+	return []api.Location{addressesToLocation(addrs)}, "", nil
 }
 
 func (loc *NormalLocationSpec) findFuncCandidates(bi *proc.BinaryInfo, limit int) []string {
@@ -450,7 +450,8 @@ func (loc *NormalLocationSpec) findFuncCandidates(bi *proc.BinaryInfo, limit int
 		}
 		candidateFuncs[fname] = struct{}{}
 	}
-	for _, f := range bi.LookupFunc {
+	for _, fns := range bi.LookupFunc() {
+		f := fns[0]
 		if len(candidateFuncs) >= limit {
 			break
 		}
@@ -478,96 +479,185 @@ func (loc *NormalLocationSpec) findFuncCandidates(bi *proc.BinaryInfo, limit int
 	return r
 }
 
-func crossPlatformPath(path string) string {
-	if runtime.GOOS == "windows" {
-		return strings.ToLower(path)
+// isAbs returns true if path looks like an absolute path.
+func isAbs(path string) bool {
+	// Unix-like absolute path
+	if strings.HasPrefix(path, "/") {
+		return true
 	}
-	return path
+	return windowsAbsPath(path)
+}
+
+func windowsAbsPath(path string) bool {
+	// Windows UNC absolute path
+	if strings.HasPrefix(path, `\\`) {
+		return true
+	}
+	// DOS absolute paths
+	if len(path) < 3 || path[1] != ':' {
+		return false
+	}
+	return path[2] == '/' || path[2] == '\\'
+}
+
+func hasPathSeparatorSuffix(path string) bool {
+	return strings.HasSuffix(path, "/") || strings.HasSuffix(path, "\\")
+}
+
+func hasPathSeparatorPrefix(path string) bool {
+	return strings.HasPrefix(path, "/") || strings.HasPrefix(path, "\\")
+}
+
+func pickSeparator(to string) string {
+	var sep byte
+	for i := range to {
+		if to[i] == '/' || to[i] == '\\' {
+			if sep == 0 {
+				sep = to[i]
+			} else if sep != to[i] {
+				return ""
+			}
+		}
+	}
+	return string(sep)
+}
+
+func joinPath(to, rest string) string {
+	sep := pickSeparator(to)
+
+	switch sep {
+	case "/":
+		rest = strings.ReplaceAll(rest, "\\", sep)
+	case "\\":
+		rest = strings.ReplaceAll(rest, "/", sep)
+	default:
+		sep = "/"
+	}
+
+	toEndsWithSlash := hasPathSeparatorSuffix(to)
+	restStartsWithSlash := hasPathSeparatorPrefix(rest)
+
+	switch {
+	case toEndsWithSlash && restStartsWithSlash:
+		return to[:len(to)-1] + rest
+	case toEndsWithSlash && !restStartsWithSlash:
+		return to + rest
+	case !toEndsWithSlash && restStartsWithSlash:
+		return to + rest
+	case !toEndsWithSlash && !restStartsWithSlash:
+		fallthrough
+	default:
+		return to + sep + rest
+	}
 }
 
 // SubstitutePath applies the specified path substitution rules to path.
 func SubstitutePath(path string, rules [][2]string) string {
-	path = crossPlatformPath(path)
-	// On windows paths returned from headless server are as c:/dir/dir
-	// though os.PathSeparator is '\\'
-
-	separator := "/"                  // make it default
-	if strings.Contains(path, "\\") { // dependent on the path
-		separator = "\\"
+	// Look for evidence that we are dealing with windows somewhere, if we are use case-insensitive matching
+	caseInsensitive := windowsAbsPath(path)
+	if !caseInsensitive {
+		for i := range rules {
+			if windowsAbsPath(rules[i][0]) || windowsAbsPath(rules[i][1]) {
+				caseInsensitive = true
+				break
+			}
+		}
 	}
 	for _, r := range rules {
-		from := crossPlatformPath(r[0])
-		to := r[1]
+		from, to := r[0], r[1]
 
-		// If we have an exact match, use it directly.
+		// if we have an exact match, use it directly.
 		if path == from {
 			return to
 		}
 
-		// Otherwise check if it's a directory prefix.
-		if from != "" && !strings.HasSuffix(from, separator) {
-			from = from + separator
-		}
-		if to != "" && !strings.HasSuffix(to, separator) {
-			to = to + separator
+		match := false
+		var rest string
+		if from == "" {
+			match = !isAbs(path)
+			rest = path
+		} else {
+			if caseInsensitive {
+				match = strings.HasPrefix(strings.ToLower(path), strings.ToLower(from))
+				if match {
+					path = strings.ToLower(path)
+					from = strings.ToLower(from)
+				}
+			} else {
+				match = strings.HasPrefix(path, from)
+			}
+			if match {
+				// make sure the match ends on something that looks like a path separator boundary
+				rest = path[len(from):]
+				match = hasPathSeparatorSuffix(from) || hasPathSeparatorPrefix(rest)
+			}
 		}
 
-		// Expand relative paths with the specified prefix
-		if from == "" && !filepath.IsAbs(path) {
-			return strings.Replace(path, from, to, 1)
-		}
+		if match {
+			if to == "" {
+				// make sure we return a relative path, regardless of whether 'from' consumed a final / or not
+				if hasPathSeparatorPrefix(rest) {
+					return rest[1:]
+				}
+				return rest
+			}
 
-		if from != "" && strings.HasPrefix(path, from) {
-			return strings.Replace(path, from, to, 1)
+			return joinPath(to, rest)
 		}
 	}
 	return path
 }
 
 func addressesToLocation(addrs []uint64) api.Location {
-	if len(addrs) <= 0 {
+	if len(addrs) == 0 {
 		return api.Location{}
 	}
 	return api.Location{PC: addrs[0], PCs: addrs}
 }
 
 // Find returns the location after adding the offset amount to the current line number.
-func (loc *OffsetLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, _ string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, error) {
+func (loc *OffsetLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, _ string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, string, error) {
 	if scope == nil {
-		return nil, fmt.Errorf("could not determine current location (scope is nil)")
-	}
-	if loc.Offset == 0 {
-		return []api.Location{{PC: scope.PC}}, nil
+		return nil, "", fmt.Errorf("could not determine current location (scope is nil)")
 	}
 	file, line, fn := scope.BinInfo.PCToLine(scope.PC)
-	if fn == nil {
-		return nil, fmt.Errorf("could not determine current location")
+	if loc.Offset == 0 {
+		subst := ""
+		if fn != nil {
+			subst = fmt.Sprintf("%s:%d", file, line)
+		}
+		return []api.Location{{PC: scope.PC}}, subst, nil
 	}
+	if fn == nil {
+		return nil, "", fmt.Errorf("could not determine current location")
+	}
+	subst := fmt.Sprintf("%s:%d", file, line+loc.Offset)
 	addrs, err := proc.FindFileLocation(t, file, line+loc.Offset)
 	if includeNonExecutableLines {
 		if _, isCouldNotFindLine := err.(*proc.ErrCouldNotFindLine); isCouldNotFindLine {
-			return []api.Location{{File: file, Line: line + loc.Offset}}, nil
+			return []api.Location{{File: file, Line: line + loc.Offset}}, subst, nil
 		}
 	}
-	return []api.Location{addressesToLocation(addrs)}, err
+	return []api.Location{addressesToLocation(addrs)}, subst, err
 }
 
 // Find will return the location at the given line in the current file.
-func (loc *LineLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, _ string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, error) {
+func (loc *LineLocationSpec) Find(t *proc.Target, _ []string, scope *proc.EvalScope, _ string, includeNonExecutableLines bool, _ [][2]string) ([]api.Location, string, error) {
 	if scope == nil {
-		return nil, fmt.Errorf("could not determine current location (scope is nil)")
+		return nil, "", fmt.Errorf("could not determine current location (scope is nil)")
 	}
 	file, _, fn := scope.BinInfo.PCToLine(scope.PC)
 	if fn == nil {
-		return nil, fmt.Errorf("could not determine current location")
+		return nil, "", fmt.Errorf("could not determine current location")
 	}
+	subst := fmt.Sprintf("%s:%d", file, loc.Line)
 	addrs, err := proc.FindFileLocation(t, file, loc.Line)
 	if includeNonExecutableLines {
 		if _, isCouldNotFindLine := err.(*proc.ErrCouldNotFindLine); isCouldNotFindLine {
-			return []api.Location{{File: file, Line: loc.Line}}, nil
+			return []api.Location{{File: file, Line: loc.Line}}, subst, nil
 		}
 	}
-	return []api.Location{addressesToLocation(addrs)}, err
+	return []api.Location{addressesToLocation(addrs)}, subst, err
 }
 
 func regexFilterFuncs(filter string, allFuncs []proc.Function) ([]string, error) {

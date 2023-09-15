@@ -16,13 +16,17 @@ import (
 var ErrNativeBackendDisabled = errors.New("native backend disabled during compilation")
 
 // Launch returns ErrNativeBackendDisabled.
-func Launch(_ []string, _ string, _ proc.LaunchFlags, _ []string, _ string, _ [3]string) (*proc.TargetGroup, error) {
+func Launch(_ []string, _ string, _ proc.LaunchFlags, _ []string, _ string, _ string, _ proc.OutputRedirect, _ proc.OutputRedirect) (*proc.TargetGroup, error) {
 	return nil, ErrNativeBackendDisabled
 }
 
 // Attach returns ErrNativeBackendDisabled.
-func Attach(_ int, _ []string) (*proc.TargetGroup, error) {
+func Attach(_ int, _ *proc.WaitFor, _ []string) (*proc.TargetGroup, error) {
 	return nil, ErrNativeBackendDisabled
+}
+
+func waitForSearchProcess(string, map[int]struct{}) (int, error) {
+	return 0, proc.ErrWaitForNotImplemented
 }
 
 // waitStatus is a synonym for the platform-specific WaitStatus
@@ -53,7 +57,7 @@ func (dbp *nativeProcess) requestManualStop() (err error) {
 	panic(ErrNativeBackendDisabled)
 }
 
-func (dbp *nativeProcess) resume() error {
+func (*processGroup) resume() error {
 	panic(ErrNativeBackendDisabled)
 }
 
@@ -69,7 +73,7 @@ func (dbp *nativeProcess) updateThreadList() error {
 	panic(ErrNativeBackendDisabled)
 }
 
-func (dbp *nativeProcess) kill() (err error) {
+func (*processGroup) kill(dbp *nativeProcess) (err error) {
 	panic(ErrNativeBackendDisabled)
 }
 
@@ -142,4 +146,4 @@ func (t *nativeThread) SoftExc() bool {
 	panic(ErrNativeBackendDisabled)
 }
 
-func initialize(dbp *nativeProcess) error { return nil }
+func initialize(dbp *nativeProcess) (string, error) { return "", nil }

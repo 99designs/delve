@@ -53,6 +53,9 @@ func TestDebugger_LaunchInvalidFormat(t *testing.T) {
 	if runtime.GOARCH == "arm64" && runtime.GOOS == "linux" {
 		os.Setenv("GOARCH", "amd64")
 	}
+	if runtime.GOARCH == "ppc64le" && runtime.GOOS == "linux" {
+		os.Setenv("GOARCH", "amd64")
+	}
 	os.Setenv("GOOS", switchOS[runtime.GOOS])
 	exepath := filepath.Join(buildtestdir, debugname)
 	if err := gobuild.GoBuild(debugname, []string{buildtestdir}, fmt.Sprintf("-o %s", exepath)); err != nil {
@@ -66,7 +69,7 @@ func TestDebugger_LaunchInvalidFormat(t *testing.T) {
 		t.Fatalf("expected error but none was generated")
 	}
 	if err != api.ErrNotExecutable {
-		t.Fatalf("expected error \"%s\" got \"%v\"", api.ErrNotExecutable, err)
+		t.Fatalf("expected error %q got \"%v\"", api.ErrNotExecutable, err)
 	}
 }
 

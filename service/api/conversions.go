@@ -54,8 +54,11 @@ func ConvertLogicalBreakpoint(lbp *proc.LogicalBreakpoint) *Breakpoint {
 }
 
 // ConvertPhysicalBreakpoints adds informations from physical breakpoints to an API breakpoint.
-func ConvertPhysicalBreakpoints(b *Breakpoint, pids []int, bps []*proc.Breakpoint) {
+func ConvertPhysicalBreakpoints(b *Breakpoint, lbp *proc.LogicalBreakpoint, pids []int, bps []*proc.Breakpoint) {
 	if len(bps) == 0 {
+		if lbp != nil {
+			b.ExprString = lbp.Set.ExprString
+		}
 		return
 	}
 
@@ -429,10 +432,17 @@ func ConvertRegisters(in *op.DwarfRegisters, dwarfRegisterToString func(int, *op
 	return
 }
 
+// ConvertImage converts proc.Image to api.Image.
 func ConvertImage(image *proc.Image) Image {
-	return Image{Path: image.Path, Address: image.StaticBase}
+	err := image.LoadError()
+	lerr := ""
+	if err != nil {
+		lerr = err.Error()
+	}
+	return Image{Path: image.Path, Address: image.StaticBase, LoadError: lerr}
 }
 
+// ConvertDumpState converts proc.DumpState to api.DumpState.
 func ConvertDumpState(dumpState *proc.DumpState) *DumpState {
 	dumpState.Mutex.Lock()
 	defer dumpState.Mutex.Unlock()
@@ -448,4 +458,13 @@ func ConvertDumpState(dumpState *proc.DumpState) *DumpState {
 		r.Err = dumpState.Err.Error()
 	}
 	return r
+}
+
+// ConvertTarget converts a proc.Target into a api.Target.
+func ConvertTarget(tgt *proc.Target, convertThreadBreakpoint func(proc.Thread) *Breakpoint) *Target {
+	return &Target{
+		Pid:           tgt.Pid(),
+		CmdLine:       tgt.CmdLine,
+		CurrentThread: ConvertThread(tgt.CurrentThread(), convertThreadBreakpoint(tgt.CurrentThread())),
+	}
 }

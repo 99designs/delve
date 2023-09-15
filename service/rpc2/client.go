@@ -383,16 +383,16 @@ func (c *RPCClient) ListFunctionArgs(scope api.EvalScope, cfg api.LoadConfig) ([
 
 func (c *RPCClient) ListGoroutines(start, count int) ([]*api.Goroutine, int, error) {
 	var out ListGoroutinesOut
-	err := c.call("ListGoroutines", ListGoroutinesIn{start, count, nil, api.GoroutineGroupingOptions{}}, &out)
+	err := c.call("ListGoroutines", ListGoroutinesIn{start, count, nil, api.GoroutineGroupingOptions{}, nil}, &out)
 	return out.Goroutines, out.Nextg, err
 }
 
-func (c *RPCClient) ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error) {
+func (c *RPCClient) ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions, scope *api.EvalScope) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error) {
 	if group == nil {
 		group = &api.GoroutineGroupingOptions{}
 	}
 	var out ListGoroutinesOut
-	err := c.call("ListGoroutines", ListGoroutinesIn{start, count, filters, *group}, &out)
+	err := c.call("ListGoroutines", ListGoroutinesIn{start, count, filters, *group, scope}, &out)
 	return out.Goroutines, out.Groups, out.Nextg, out.TooManyGroups, err
 }
 
@@ -414,10 +414,10 @@ func (c *RPCClient) AttachedToExistingProcess() bool {
 	return out.Answer
 }
 
-func (c *RPCClient) FindLocation(scope api.EvalScope, loc string, findInstructions bool, substitutePathRules [][2]string) ([]api.Location, error) {
+func (c *RPCClient) FindLocation(scope api.EvalScope, loc string, findInstructions bool, substitutePathRules [][2]string) ([]api.Location, string, error) {
 	var out FindLocationOut
 	err := c.call("FindLocation", FindLocationIn{scope, loc, !findInstructions, substitutePathRules}, &out)
-	return out.Locations, err
+	return out.Locations, out.SubstituteLocExpr, err
 }
 
 // DisassembleRange disassembles code between startPC and endPC
@@ -528,6 +528,40 @@ func (c *RPCClient) CoreDumpWait(msec int) api.DumpState {
 func (c *RPCClient) CoreDumpCancel() error {
 	out := &DumpCancelOut{}
 	return c.call("DumpCancel", DumpCancelIn{}, out)
+}
+
+// ListTargets returns the current list of debug targets.
+func (c *RPCClient) ListTargets() ([]api.Target, error) {
+	out := &ListTargetsOut{}
+	err := c.call("ListTargets", ListTargetsIn{}, out)
+	return out.Targets, err
+}
+
+// FollowExec enabled or disabled follow exec mode. When follow exec is
+// enabled Delve will automatically attach to new subprocesses with a
+// command line matched by regex, if regex is nil all new subprocesses are
+// automatically debugged.
+func (c *RPCClient) FollowExec(v bool, regex string) error {
+	out := &FollowExecOut{}
+	err := c.call("FollowExec", FollowExecIn{Enable: v, Regex: regex}, out)
+	return err
+}
+
+// FollowExecEnabled returns true if follow exec mode is enabled.
+func (c *RPCClient) FollowExecEnabled() bool {
+	out := &FollowExecEnabledOut{}
+	_ = c.call("FollowExecEnabled", FollowExecEnabledIn{}, out)
+	return out.Enabled
+}
+
+func (c *RPCClient) SetDebugInfoDirectories(v []string) error {
+	return c.call("DebugInfoDirectories", DebugInfoDirectoriesIn{Set: true, List: v}, &DebugInfoDirectoriesOut{})
+}
+
+func (c *RPCClient) GetDebugInfoDirectories() ([]string, error) {
+	out := &DebugInfoDirectoriesOut{}
+	err := c.call("DebugInfoDirectories", DebugInfoDirectoriesIn{Set: false, List: nil}, out)
+	return out.List, err
 }
 
 func (c *RPCClient) call(method string, args, reply interface{}) error {

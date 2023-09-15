@@ -83,7 +83,7 @@ func firstPCAfterPrologueDisassembly(p Process, fn *Function, sameline bool) (ui
 		return fn.Entry, err
 	}
 
-	if len(text) <= 0 {
+	if len(text) == 0 {
 		return fn.Entry, nil
 	}
 
@@ -176,6 +176,6 @@ func disassemble(memrw MemoryReadWriter, regs Registers, breakpoints *Breakpoint
 
 // Text will return the assembly instructions in human readable format according to
 // the flavour specified.
-func (inst *AsmInstruction) Text(flavour AssemblyFlavour, bi *BinaryInfo) string {
-	return inst.Inst.Text(flavour, inst.Loc.PC, bi.symLookup)
+func (instr *AsmInstruction) Text(flavour AssemblyFlavour, bi *BinaryInfo) string {
+	return instr.Inst.Text(flavour, instr.Loc.PC, bi.symLookup)
 }

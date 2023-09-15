@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/go-delve/delve/pkg/dwarf/leb128"
 	"github.com/go-delve/delve/pkg/dwarf"
+	"github.com/go-delve/delve/pkg/dwarf/leb128"
 )
 
 // Opcode represent a DWARF stack program instruction.
@@ -67,6 +67,7 @@ func ExecuteStackProgram(regs DwarfRegisters, instructions []byte, ptrSize int, 
 		stack:          make([]int64, 0, 3),
 		DwarfRegisters: regs,
 		ptrSize:        ptrSize,
+		readMemory:     readMemory,
 	}
 
 	for tick := 0; tick < len(instructions)*arbitraryExecutionLimitFactor; tick++ {
@@ -347,7 +348,7 @@ func constu(opcode Opcode, ctxt *context) error {
 }
 
 func dup(_ Opcode, ctxt *context) error {
-	if len(ctxt.stack) <= 0 {
+	if len(ctxt.stack) == 0 {
 		return ErrStackUnderflow
 	}
 	ctxt.stack = append(ctxt.stack, ctxt.stack[len(ctxt.stack)-1])
@@ -355,7 +356,7 @@ func dup(_ Opcode, ctxt *context) error {
 }
 
 func drop(_ Opcode, ctxt *context) error {
-	if len(ctxt.stack) <= 0 {
+	if len(ctxt.stack) == 0 {
 		return ErrStackUnderflow
 	}
 	ctxt.stack = ctxt.stack[:len(ctxt.stack)-1]
@@ -540,7 +541,7 @@ func deref(op Opcode, ctxt *context) error {
 		sz = int(n)
 	}
 
-	if len(ctxt.stack) <= 0 {
+	if len(ctxt.stack) == 0 {
 		return ErrStackUnderflow
 	}
 
@@ -548,7 +549,7 @@ func deref(op Opcode, ctxt *context) error {
 	ctxt.stack = ctxt.stack[:len(ctxt.stack)-1]
 
 	if op == DW_OP_xderef || op == DW_OP_xderef_size {
-		if len(ctxt.stack) <= 0 {
+		if len(ctxt.stack) == 0 {
 			return ErrStackUnderflow
 		}
 		// the second element on the stack is the "address space identifier" which we don't do anything with

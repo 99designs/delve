@@ -28,17 +28,17 @@ import (
 func (t *Target) setStackWatchBreakpoints(scope *EvalScope, watchpoint *Breakpoint) error {
 	// Watchpoint Out-of-scope Sentinel
 
-	woos := func(_ Thread) bool {
+	woos := func(_ Thread, _ *Target) (bool, error) {
 		watchpointOutOfScope(t, watchpoint)
-		return true
+		return true, nil
 	}
 
-	topframe, retframe, err := topframe(scope.g, nil)
+	topframe, retframe, err := topframe(t, scope.g, nil)
 	if err != nil {
 		return err
 	}
 
-	sameGCond := sameGoroutineCondition(scope.g)
+	sameGCond := sameGoroutineCondition(scope.BinInfo, scope.g, 0)
 	retFrameCond := astutil.And(sameGCond, frameoffCondition(&retframe))
 
 	var deferpc uint64
@@ -111,9 +111,9 @@ func (t *Target) setStackWatchBreakpoints(scope *EvalScope, watchpoint *Breakpoi
 
 	rszbreaklet := rszbp.Breaklets[len(rszbp.Breaklets)-1]
 	rszbreaklet.watchpoint = watchpoint
-	rszbreaklet.callback = func(th Thread) bool {
+	rszbreaklet.callback = func(th Thread, _ *Target) (bool, error) {
 		adjustStackWatchpoint(t, th, watchpoint)
-		return false // we never want this breakpoint to be shown to the user
+		return false, nil // we never want this breakpoint to be shown to the user
 	}
 
 	return nil

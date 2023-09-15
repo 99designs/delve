@@ -47,7 +47,7 @@ type Client interface {
 	ReverseStep() (*api.DebuggerState, error)
 	// StepOut continues to the return address of the current function.
 	StepOut() (*api.DebuggerState, error)
-	// ReverseStepOut continues backward to the calle rof the current function.
+	// ReverseStepOut continues backward to the caller of the current function.
 	ReverseStepOut() (*api.DebuggerState, error)
 	// Call resumes process execution while making a function call.
 	Call(goroutineID int64, expr string, unsafe bool) (*api.DebuggerState, error)
@@ -120,7 +120,7 @@ type Client interface {
 	// ListGoroutines lists all goroutines.
 	ListGoroutines(start, count int) ([]*api.Goroutine, int, error)
 	// ListGoroutinesWithFilter lists goroutines matching the filters
-	ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error)
+	ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions, scope *api.EvalScope) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error)
 
 	// Stacktrace returns stacktrace
 	Stacktrace(goroutineID int64, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error)
@@ -143,7 +143,7 @@ type Client interface {
 	// * *<address> returns the location corresponding to the specified address
 	// NOTE: this function does not actually set breakpoints.
 	// If findInstruction is true FindLocation will only return locations that correspond to instructions.
-	FindLocation(scope api.EvalScope, loc string, findInstruction bool, substitutePathRules [][2]string) ([]api.Location, error)
+	FindLocation(scope api.EvalScope, loc string, findInstruction bool, substitutePathRules [][2]string) ([]api.Location, string, error)
 
 	// DisassembleRange disassemble code between startPC and endPC
 	DisassembleRange(scope api.EvalScope, startPC, endPC uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error)
@@ -185,9 +185,23 @@ type Client interface {
 	// CoreDumpCancel cancels a core dump in progress
 	CoreDumpCancel() error
 
+	// ListTargets returns the list of connected targets
+	ListTargets() ([]api.Target, error)
+	// FollowExec enables or disables the follow exec mode. In follow exec mode
+	// Delve will automatically debug child processes launched by the target
+	// process
+	FollowExec(bool, string) error
+	FollowExecEnabled() bool
+
 	// Disconnect closes the connection to the server without sending a Detach request first.
 	// If cont is true a continue command will be sent instead.
 	Disconnect(cont bool) error
+
+	// SetDebugInfoDirectories sets directories used to search for debug symbols
+	SetDebugInfoDirectories([]string) error
+
+	// GetDebugInfoDirectories returns the list of directories used to search for debug symbols
+	GetDebugInfoDirectories() ([]string, error)
 
 	// CallAPI allows calling an arbitrary rpc method (used by starlark bindings)
 	CallAPI(method string, args, reply interface{}) error

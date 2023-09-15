@@ -42,7 +42,7 @@ func (os *osProcessDetails) Close() {}
 // custom fork/exec process in order to take advantage of
 // PT_SIGEXC on Darwin which will turn Unix signals into
 // Mach exceptions.
-func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, _ [3]string) (*proc.TargetGroup, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, _ string, _ proc.OutputRedirect, _ proc.OutputRedirect) (*proc.TargetGroup, error) {
 	argv0Go, err := filepath.Abs(cmd[0])
 	if err != nil {
 		return nil, err
@@ -71,7 +71,7 @@ func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ strin
 	dbp := newProcess(0)
 	defer func() {
 		if err != nil && dbp.pid != 0 {
-			_ = dbp.Detach(true)
+			_ = detachWithoutGroup(dbp, true)
 		}
 	}()
 	var pid int
@@ -136,8 +136,15 @@ func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ strin
 	return tgt, err
 }
 
+func waitForSearchProcess(string, map[int]struct{}) (int, error) {
+	return 0, proc.ErrWaitForNotImplemented
+}
+
 // Attach to an existing process with the given PID.
-func Attach(pid int, _ []string) (*proc.TargetGroup, error) {
+func Attach(pid int, waitFor *proc.WaitFor, _ []string) (*proc.TargetGroup, error) {
+	if waitFor.Valid() {
+		return nil, proc.ErrWaitForNotImplemented
+	}
 	if err := macutil.CheckRosetta(); err != nil {
 		return nil, err
 	}
@@ -165,14 +172,14 @@ func Attach(pid int, _ []string) (*proc.TargetGroup, error) {
 
 	tgt, err := dbp.initialize("", []string{})
 	if err != nil {
-		dbp.Detach(false)
+		detachWithoutGroup(dbp, false)
 		return nil, err
 	}
 	return tgt, nil
 }
 
 // Kill kills the process.
-func (dbp *nativeProcess) kill() (err error) {
+func (procgrp *processGroup) kill(dbp *nativeProcess) (err error) {
 	if dbp.exited {
 		return nil
 	}
@@ -413,6 +420,10 @@ func (dbp *nativeProcess) exitGuard(err error) error {
 	return err
 }
 
+func (procgrp *processGroup) resume() error {
+	return procgrp.procs[0].resume()
+}
+
 func (dbp *nativeProcess) resume() error {
 	// all threads stopped over a breakpoint are made to step over it
 	for _, thread := range dbp.threads {
@@ -489,4 +500,4 @@ func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
 	panic("not implemented")
 }
 
-func initialize(dbp *nativeProcess) error { return nil }
+func initialize(dbp *nativeProcess) (string, error) { return "", nil }

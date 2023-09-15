@@ -19,6 +19,8 @@ var autoLoadConfig = api.LoadConfig{MaxVariableRecurse: 1, MaxStringLen: 1024, M
 // decoding JSON) into a starlark.Value.
 func (env *Env) interfaceToStarlarkValue(v interface{}) starlark.Value {
 	switch v := v.(type) {
+	case bool:
+		return starlark.Bool(bool(v))
 	case uint8:
 		return starlark.MakeUint64(uint64(v))
 	case uint16:
@@ -179,7 +181,7 @@ func (v structAsStarlarkValue) Attr(name string) (starlark.Value, error) {
 		return r, err
 	}
 	r := v.v.FieldByName(name)
-	if r == (reflect.Value{}) {
+	if !r.IsValid() {
 		return starlark.None, fmt.Errorf("no field named %q in %T", name, v.v.Interface())
 	}
 	return v.env.interfaceToStarlarkValue(r.Interface()), nil
@@ -231,6 +233,9 @@ func (env *Env) variableValueToStarlarkValue(v *api.Variable, top bool) (starlar
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
 		n, _ := strconv.ParseUint(v.Value, 0, 64)
 		return starlark.MakeUint64(n), nil
+	case reflect.Bool:
+		n, _ := strconv.ParseBool(v.Value)
+		return starlark.Bool(n), nil
 	case reflect.Float32, reflect.Float64:
 		switch v.Value {
 		case "+Inf":
@@ -448,10 +453,15 @@ func (v ptrVariableAsStarlarkValue) Attr(name string) (starlark.Value, error) {
 }
 
 func (v ptrVariableAsStarlarkValue) AttrNames() []string {
+	if len(v.v.Children) == 0 {
+		// The pointer variable was not loaded; we don't know the field names.
+		return nil
+	}
 	if v.v.Children[0].Kind != reflect.Struct {
 		return nil
 	}
-	// autodereference
+	// autodereference: present the field names of the pointed-to struct as the
+	// fields of this pointer variable.
 	x := structVariableAsStarlarkValue{&v.v.Children[0], v.env}
 	return x.AttrNames()
 }
@@ -654,8 +664,9 @@ func unmarshalStarlarkValueIntl(val starlark.Value, dst reflect.Value, path stri
 		if dst.Kind() != reflect.Slice {
 			return converr()
 		}
+		dst.Set(reflect.MakeSlice(dst.Type(), val.Len(), val.Len()))
 		for i := 0; i < val.Len(); i++ {
-			cur := reflect.New(dst.Type().Elem())
+			cur := dst.Index(i).Addr()
 			err := unmarshalStarlarkValueIntl(val.Index(i), cur, path)
 			if err != nil {
 				return err
@@ -671,7 +682,7 @@ func unmarshalStarlarkValueIntl(val starlark.Value, dst reflect.Value, path stri
 			}
 			fieldName := string(k.(starlark.String))
 			dstfield := dst.FieldByName(fieldName)
-			if dstfield == (reflect.Value{}) {
+			if !dstfield.IsValid() {
 				return converr(fmt.Sprintf("unknown field %s", fieldName))
 			}
 			valfield, _, _ := val.Get(starlark.String(fieldName))

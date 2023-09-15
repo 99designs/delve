@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"debug/dwarf"
 	"debug/elf"
+	"debug/gosym"
 	"debug/macho"
 	"debug/pe"
 	"encoding/binary"
@@ -51,7 +52,7 @@ type BinaryInfo struct {
 	// GOOS operating system this binary is executing on.
 	GOOS string
 
-	debugInfoDirectories []string
+	DebugInfoDirectories []string
 
 	// BuildID of this binary.
 	BuildID string
@@ -60,8 +61,8 @@ type BinaryInfo struct {
 	Functions []Function
 	// Sources is a list of all source files found in debug_line.
 	Sources []string
-	// LookupFunc maps function names to a description of the function.
-	LookupFunc map[string]*Function
+	// lookupFunc maps function names to a description of the function.
+	lookupFunc map[string][]*Function
 	// lookupGenericFunc maps function names, with their type parameters removed, to functions.
 	// Functions that are not generic are not added to this map.
 	lookupGenericFunc map[string][]*Function
@@ -128,6 +129,7 @@ var (
 		elf.EM_X86_64:  true,
 		elf.EM_AARCH64: true,
 		elf.EM_386:     true,
+		elf.EM_PPC64:   true,
 	}
 
 	supportedWindowsArch = map[_PEMachine]bool{
@@ -278,7 +280,7 @@ func FindFileLocation(p Process, filename string, lineno int) ([]uint64, error) 
 	return selectedPCs, nil
 }
 
-// inlRnage is the range of an inlined call
+// inlRange is the range of an inlined call
 type inlRange struct {
 	off   dwarf.Offset
 	depth uint32
@@ -311,8 +313,8 @@ func allInlineCallRanges(tree *godwarf.Tree) []inlRange {
 
 // FindFunction returns the functions with name funcName.
 func (bi *BinaryInfo) FindFunction(funcName string) ([]*Function, error) {
-	if fn := bi.LookupFunc[funcName]; fn != nil {
-		return []*Function{fn}, nil
+	if fns := bi.LookupFunc()[funcName]; fns != nil {
+		return fns, nil
 	}
 	fns := bi.LookupGenericFunc()[funcName]
 	if len(fns) == 0 {
@@ -332,7 +334,7 @@ func FindFunctionLocation(p Process, funcName string, lineOffset int) ([]uint64,
 
 	if lineOffset > 0 {
 		fn := origfns[0]
-		filename, lineno := fn.cu.lineInfo.PCToLine(fn.Entry, fn.Entry)
+		filename, lineno := bi.EntryLineForFunc(fn)
 		return FindFileLocation(p, filename, lineno+lineOffset)
 	}
 
@@ -364,14 +366,16 @@ func FindFunctionLocation(p Process, funcName string, lineOffset int) ([]uint64,
 // If sameline is set FirstPCAfterPrologue will always return an
 // address associated with the same line as fn.Entry.
 func FirstPCAfterPrologue(p Process, fn *Function, sameline bool) (uint64, error) {
-	pc, _, line, ok := fn.cu.lineInfo.PrologueEndPC(fn.Entry, fn.End)
-	if ok {
-		if !sameline {
-			return pc, nil
-		}
-		_, entryLine := fn.cu.lineInfo.PCToLine(fn.Entry, fn.Entry)
-		if entryLine == line {
-			return pc, nil
+	if fn.cu.lineInfo != nil {
+		pc, _, line, ok := fn.cu.lineInfo.PrologueEndPC(fn.Entry, fn.End)
+		if ok {
+			if !sameline {
+				return pc, nil
+			}
+			_, entryLine := p.BinInfo().EntryLineForFunc(fn)
+			if entryLine == line {
+				return pc, nil
+			}
 		}
 	}
 
@@ -380,7 +384,7 @@ func FirstPCAfterPrologue(p Process, fn *Function, sameline bool) (uint64, error
 		return fn.Entry, err
 	}
 
-	if pc == fn.Entry {
+	if pc == fn.Entry && fn.cu.lineInfo != nil {
 		// Look for the first instruction with the stmt flag set, so that setting a
 		// breakpoint with file:line and with the function name always result on
 		// the same instruction being selected.
@@ -393,7 +397,7 @@ func FirstPCAfterPrologue(p Process, fn *Function, sameline bool) (uint64, error
 }
 
 func findRetPC(t *Target, name string) ([]uint64, error) {
-	fn := t.BinInfo().LookupFunc[name]
+	fn := t.BinInfo().lookupOneFunc(name)
 	if fn == nil {
 		return nil, fmt.Errorf("could not find %s", name)
 	}
@@ -601,6 +605,25 @@ func (fn *Function) PrologueEndPC() uint64 {
 	return pc
 }
 
+func (fn *Function) AllPCs(excludeFile string, excludeLine int) ([]uint64, error) {
+	if !fn.cu.image.Stripped() {
+		return fn.cu.lineInfo.AllPCsBetween(fn.Entry, fn.End-1, excludeFile, excludeLine)
+	}
+	var pcs []uint64
+	fnFile, lastLine, _ := fn.cu.image.symTable.PCToLine(fn.Entry - fn.cu.image.StaticBase)
+	for pc := fn.Entry - fn.cu.image.StaticBase; pc < fn.End-fn.cu.image.StaticBase; pc++ {
+		f, line, pcfn := fn.cu.image.symTable.PCToLine(pc)
+		if pcfn == nil {
+			continue
+		}
+		if f == fnFile && line > lastLine {
+			lastLine = line
+			pcs = append(pcs, pc+fn.cu.image.StaticBase)
+		}
+	}
+	return pcs, nil
+}
+
 // From $GOROOT/src/runtime/traceback.go:597
 // exportedRuntime reports whether the function is an exported runtime function.
 // It is only for runtime functions, so ASCII A-Z is fine.
@@ -665,6 +688,8 @@ func NewBinaryInfo(goos, goarch string) *BinaryInfo {
 		r.Arch = AMD64Arch(goos)
 	case "arm64":
 		r.Arch = ARM64Arch(goos)
+	case "ppc64le":
+		r.Arch = PPC64LEArch(goos)
 	}
 	return r
 }
@@ -676,7 +701,7 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 		bi.lastModified = fi.ModTime()
 	}
 
-	bi.debugInfoDirectories = debugInfoDirs
+	bi.DebugInfoDirectories = debugInfoDirs
 
 	return bi.AddImage(path, entryPoint)
 }
@@ -719,6 +744,9 @@ func (bi *BinaryInfo) LastModified() time.Time {
 
 // DwarfReader returns a reader for the dwarf data
 func (so *Image) DwarfReader() *reader.Reader {
+	if so.dwarf == nil {
+		return nil
+	}
 	return reader.New(so.dwarf)
 }
 
@@ -731,13 +759,26 @@ func (bi *BinaryInfo) Types() ([]string, error) {
 	return types, nil
 }
 
+func (bi *BinaryInfo) EntryLineForFunc(fn *Function) (string, int) {
+	return bi.pcToLine(fn, fn.Entry)
+}
+
+func (bi *BinaryInfo) pcToLine(fn *Function, pc uint64) (string, int) {
+	if fn.cu.lineInfo == nil {
+		f, l, _ := fn.cu.image.symTable.PCToLine(pc - fn.cu.image.StaticBase)
+		return f, l
+	}
+	f, l := fn.cu.lineInfo.PCToLine(fn.Entry, pc)
+	return f, l
+}
+
 // PCToLine converts an instruction address to a file/line/function.
 func (bi *BinaryInfo) PCToLine(pc uint64) (string, int, *Function) {
 	fn := bi.PCToFunc(pc)
 	if fn == nil {
 		return "", 0, nil
 	}
-	f, ln := fn.cu.lineInfo.PCToLine(fn.Entry, pc)
+	f, ln := bi.pcToLine(fn, pc)
 	return f, ln, fn
 }
 
@@ -810,6 +851,8 @@ type Image struct {
 	debugAddr    *godwarf.DebugAddrSection
 	debugLineStr []byte
 
+	symTable *gosym.Table
+
 	typeCache map[dwarf.Offset]godwarf.Type
 
 	compileUnits []*compileUnit // compileUnits is sorted by increasing DWARF offset
@@ -833,6 +876,10 @@ func (image *Image) registerRuntimeTypeToDIE(entry *dwarf.Entry, ardr *reader.Re
 			image.runtimeTypeToDIE[off] = runtimeTypeDIE{entry.Offset, -1}
 		}
 	}
+}
+
+func (image *Image) Stripped() bool {
+	return image.dwarf == nil
 }
 
 // AddImage adds the specified image to bi, loading data asynchronously.
@@ -898,6 +945,13 @@ func (bi *BinaryInfo) imageToModuleData(image *Image, mds []moduleData) *moduleD
 // typeToImage returns the image containing the give type.
 func (bi *BinaryInfo) typeToImage(typ godwarf.Type) *Image {
 	return bi.Images[typ.Common().Index]
+}
+
+func (bi *BinaryInfo) runtimeTypeTypename() string {
+	if goversion.ProducerAfterOrEqual(bi.Producer(), 1, 21) {
+		return "internal/abi.Type"
+	}
+	return "runtime._type"
 }
 
 var errBinaryInfoClose = errors.New("multiple errors closing executable files")
@@ -1392,13 +1446,31 @@ func loadBinaryInfoElf(bi *BinaryInfo, image *Image, path string, addr uint64, w
 
 	bi.loadBuildID(image, elfFile)
 	var debugInfoBytes []byte
-	image.dwarf, err = elfFile.DWARF()
-	if err != nil {
+	var dwerr error
+	image.dwarf, dwerr = elfFile.DWARF()
+	if dwerr != nil {
 		var sepFile *os.File
 		var serr error
-		sepFile, dwarfFile, serr = bi.openSeparateDebugInfo(image, elfFile, bi.debugInfoDirectories)
+		sepFile, dwarfFile, serr = bi.openSeparateDebugInfo(image, elfFile, bi.DebugInfoDirectories)
 		if serr != nil {
-			return serr
+			if len(bi.Images) <= 1 {
+				fmt.Fprintln(os.Stderr, "Warning: no debug info found, some functionality will be missing such as stack traces and variable evaluation.")
+			}
+			symTable, err := readPcLnTableElf(elfFile, path)
+			if err != nil {
+				return fmt.Errorf("could not read debug info (%v) and could not read go symbol table (%v)", dwerr, err)
+			}
+			image.symTable = symTable
+			for _, f := range image.symTable.Funcs {
+				cu := &compileUnit{}
+				cu.image = image
+				fn := Function{Name: f.Name, Entry: f.Entry + image.StaticBase, End: f.End + image.StaticBase, cu: cu}
+				bi.Functions = append(bi.Functions, fn)
+			}
+			for f := range image.symTable.Files {
+				bi.Sources = append(bi.Sources, f)
+			}
+			return nil
 		}
 		image.sepDebugCloser = sepFile
 		image.dwarf, err = dwarfFile.DWARF()
@@ -1579,6 +1651,9 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 
 		bi.gStructOffset = tlsg.Value + uint64(bi.Arch.PtrSize()*2) + ((tls.Vaddr - uint64(bi.Arch.PtrSize()*2)) & (tls.Align - 1))
 
+	case elf.EM_PPC64:
+		_ = getSymbol(image, bi.logger, exe, "runtime.tls_g")
+
 	default:
 		// we should never get here
 		panic("architecture not supported")
@@ -1730,11 +1805,17 @@ func loadBinaryInfoMacho(bi *BinaryInfo, image *Image, path string, entryPoint u
 	}
 
 	if entryPoint != 0 {
-		// This is a little bit hacky. We use the entryPoint variable, but it
-		// actually holds the address of the mach-o header. We can use this
-		// to calculate the offset to the non-aslr location of the mach-o header
-		// (which is 0x100000000)
-		image.StaticBase = entryPoint - 0x100000000
+		machoOff := uint64(0x100000000)
+		for _, ld := range exe.Loads {
+			if seg, _ := ld.(*macho.Segment); seg != nil {
+				if seg.Name == "__TEXT" {
+					machoOff = seg.Addr
+					break
+				}
+			}
+		}
+		logflags.DebuggerLogger().Debugf("entryPoint %#x machoOff %#x", entryPoint, machoOff)
+		image.StaticBase = entryPoint - machoOff
 	}
 
 	image.closer = exe
@@ -2068,7 +2149,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			if hasLineInfo && lineInfoOffset >= 0 && lineInfoOffset < int64(len(debugLineBytes)) {
 				var logfn func(string, ...interface{})
 				if logflags.DebugLineErrors() {
-					logfn = logflags.DebugLineLogger().Printf
+					logfn = logflags.DebugLineLogger().Debugf
 				}
 				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), image.debugLineStr, logfn, image.StaticBase, bi.GOOS == "windows", bi.Arch.PtrSize())
 			}
@@ -2111,11 +2192,8 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 	sort.Sort(functionsDebugInfoByEntry(bi.Functions))
 	sort.Sort(packageVarsByAddr(bi.packageVars))
 
-	bi.LookupFunc = make(map[string]*Function)
+	bi.lookupFunc = nil
 	bi.lookupGenericFunc = nil
-	for i := range bi.Functions {
-		bi.LookupFunc[bi.Functions[i].Name] = &bi.Functions[i]
-	}
 
 	for _, cu := range image.compileUnits {
 		if cu.lineInfo != nil {
@@ -2129,14 +2207,15 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 
 	if bi.regabi {
 		// prepare patch for runtime.mallocgc's DIE
-		fn := bi.LookupFunc["runtime.mallocgc"]
+		fn := bi.lookupOneFunc("runtime.mallocgc")
 		if fn != nil && fn.cu.image == image {
 			tree, err := image.getDwarfTree(fn.offset)
 			if err == nil {
-				tree.Children, err = regabiMallocgcWorkaround(bi)
+				children, err := regabiMallocgcWorkaround(bi)
 				if err != nil {
-					bi.logger.Errorf("could not patch runtime.mallogc: %v", err)
+					bi.logger.Errorf("could not patch runtime.mallocgc: %v", err)
 				} else {
+					tree.Children = children
 					image.runtimeMallocgcTree = tree
 				}
 			}
@@ -2164,6 +2243,25 @@ func (bi *BinaryInfo) LookupGenericFunc() map[string][]*Function {
 		}
 	}
 	return bi.lookupGenericFunc
+}
+
+func (bi *BinaryInfo) LookupFunc() map[string][]*Function {
+	if bi.lookupFunc == nil {
+		bi.lookupFunc = make(map[string][]*Function)
+		for i := range bi.Functions {
+			name := bi.Functions[i].Name
+			bi.lookupFunc[name] = append(bi.lookupFunc[name], &bi.Functions[i])
+		}
+	}
+	return bi.lookupFunc
+}
+
+func (bi *BinaryInfo) lookupOneFunc(name string) *Function {
+	fns := bi.LookupFunc()[name]
+	if fns == nil {
+		return nil
+	}
+	return fns[0]
 }
 
 // loadDebugInfoMapsCompileUnit loads entry from a single compile unit.
@@ -2447,7 +2545,7 @@ func (bi *BinaryInfo) loadDebugInfoMapsInlinedCalls(ctxt *loadDebugInfoMapsConte
 }
 
 func uniq(s []string) []string {
-	if len(s) <= 0 {
+	if len(s) == 0 {
 		return s
 	}
 	src, dst := 1, 1

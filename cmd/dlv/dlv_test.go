@@ -26,7 +26,6 @@ import (
 	"github.com/go-delve/delve/pkg/terminal"
 	"github.com/go-delve/delve/service/dap"
 	"github.com/go-delve/delve/service/dap/daptest"
-	"github.com/go-delve/delve/service/debugger"
 	"github.com/go-delve/delve/service/rpc2"
 	godap "github.com/google/go-dap"
 	"golang.org/x/tools/go/packages"
@@ -214,6 +213,9 @@ func getDlvBin(t *testing.T) string {
 	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 		tags = "-tags=exp.winarm64"
 	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
+		tags = "-tags=exp.linuxppc64le"
+	}
 	return getDlvBinInternal(t, tags)
 }
 
@@ -239,7 +241,7 @@ func getDlvBinInternal(t *testing.T, goflags ...string) string {
 func TestOutput(t *testing.T) {
 	dlvbin := getDlvBin(t)
 
-	for _, output := range []string{"", "myownname", filepath.Join(t.TempDir(), "absolute.path")} {
+	for _, output := range []string{"__debug_bin", "myownname", filepath.Join(t.TempDir(), "absolute.path")} {
 		testOutput(t, dlvbin, output, []string{"exit"})
 
 		const hello = "hello world!"
@@ -280,57 +282,6 @@ func TestContinue(t *testing.T) {
 		t.Fatalf("error detaching from headless instance: %v", err)
 	}
 	cmd.Wait()
-}
-
-// TestChildProcessExitWhenNoDebugInfo verifies that the child process exits when dlv launch the binary without debug info
-func TestChildProcessExitWhenNoDebugInfo(t *testing.T) {
-	noDebugFlags := protest.LinkStrip
-	// -s doesn't strip symbols on Mac, use -w instead
-	if runtime.GOOS == "darwin" {
-		noDebugFlags = protest.LinkDisableDWARF
-	}
-
-	if _, err := exec.LookPath("ps"); err != nil {
-		t.Skip("test skipped, `ps` not found")
-	}
-
-	dlvbin := getDlvBin(t)
-
-	fix := protest.BuildFixture("http_server", noDebugFlags)
-
-	// dlv exec the binary file and expect error.
-	out, err := exec.Command(dlvbin, "exec", "--headless", "--log", fix.Path).CombinedOutput()
-	t.Log(string(out))
-	if err == nil {
-		t.Fatalf("Expected err when launching the binary without debug info, but got nil")
-	}
-	//  Test only for dlv's prefix of the error like "could not launch process: could not open debug info"
-	if !strings.Contains(string(out), "could not launch process") || !strings.Contains(string(out), debugger.NoDebugWarning) {
-		t.Fatalf("Expected logged error 'could not launch process: ... - %s'", debugger.NoDebugWarning)
-	}
-
-	// search the running process named fix.Name
-	cmd := exec.Command("ps", "-aux")
-	stdout, err := cmd.StdoutPipe()
-	assertNoError(err, t, "stdout pipe")
-	defer stdout.Close()
-
-	assertNoError(cmd.Start(), t, "start `ps -aux`")
-
-	var foundFlag bool
-	scan := bufio.NewScanner(stdout)
-	for scan.Scan() {
-		t.Log(scan.Text())
-		if strings.Contains(scan.Text(), fix.Name) {
-			foundFlag = true
-			break
-		}
-	}
-	cmd.Wait()
-
-	if foundFlag {
-		t.Fatalf("Expected child process exited, but found it running")
-	}
 }
 
 // TestRedirect verifies that redirecting stdin works
@@ -422,6 +373,10 @@ func TestGeneratedDoc(t *testing.T) {
 	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 		//TODO(qmuntal): investigate further when the Windows ARM64 backend is more stable.
 		t.Skip("skipping test on Windows in CI")
+	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
+		//TODO(alexsaezm): finish CI integration
+		t.Skip("skipping test on Linux/PPC64LE in CI")
 	}
 	// Checks gen-cli-docs.go
 	var generatedBuf bytes.Buffer
@@ -707,57 +662,6 @@ func TestDAPCmd(t *testing.T) {
 			t.Errorf("got %q, want \"EOF\"\n", err)
 		}
 	}
-	client.Close()
-	cmd.Wait()
-}
-
-func TestDAPCmdWithNoDebugBinary(t *testing.T) {
-	const listenAddr = "127.0.0.1:40579"
-
-	dlvbin := getDlvBin(t)
-
-	cmd := exec.Command(dlvbin, "dap", "--log", "--listen", listenAddr)
-	stdout, err := cmd.StdoutPipe()
-	assertNoError(err, t, "stdout pipe")
-	defer stdout.Close()
-	stderr, err := cmd.StderrPipe()
-	assertNoError(err, t, "stderr pipe")
-	defer stderr.Close()
-	assertNoError(cmd.Start(), t, "start dap instance")
-
-	scanOut := bufio.NewScanner(stdout)
-	scanErr := bufio.NewScanner(stderr)
-	// Wait for the debug server to start
-	scanOut.Scan()
-	listening := "DAP server listening at: " + listenAddr
-	if scanOut.Text() != listening {
-		cmd.Process.Kill() // release the port
-		t.Fatalf("Unexpected stdout:\ngot  %q\nwant %q", scanOut.Text(), listening)
-	}
-	go func() { // Capture logging
-		for scanErr.Scan() {
-			t.Log(scanErr.Text())
-		}
-	}()
-
-	// Exec the stripped debuggee and expect things to fail
-	noDebugFlags := protest.LinkStrip
-	// -s doesn't strip symbols on Mac, use -w instead
-	if runtime.GOOS == "darwin" {
-		noDebugFlags = protest.LinkDisableDWARF
-	}
-	fixture := protest.BuildFixture("increment", noDebugFlags)
-	go func() {
-		for scanOut.Scan() {
-			t.Errorf("Unexpected stdout: %s", scanOut.Text())
-		}
-	}()
-	client := daptest.NewClient(listenAddr)
-	client.LaunchRequest("exec", fixture.Path, false)
-	client.ExpectErrorResponse(t)
-	client.DisconnectRequest()
-	client.ExpectDisconnectResponse(t)
-	client.ExpectTerminatedEvent(t)
 	client.Close()
 	cmd.Wait()
 }
@@ -1091,7 +995,7 @@ func TestTracePid(t *testing.T) {
 	assertNoError(targetCmd.Start(), t, "execute issue2023")
 
 	if targetCmd.Process == nil || targetCmd.Process.Pid == 0 {
-		t.Fatal("expected target process runninng")
+		t.Fatal("expected target process running")
 	}
 	defer targetCmd.Process.Kill()
 
@@ -1194,10 +1098,10 @@ func TestTraceEBPF(t *testing.T) {
 	output, err := ioutil.ReadAll(rdr)
 	assertNoError(err, t, "ReadAll")
 
+	cmd.Wait()
 	if !bytes.Contains(output, expected) {
 		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
 	}
-	cmd.Wait()
 }
 
 func TestTraceEBPF2(t *testing.T) {
@@ -1254,10 +1158,106 @@ func TestTraceEBPF2(t *testing.T) {
 	output, err := ioutil.ReadAll(rdr)
 	assertNoError(err, t, "ReadAll")
 
+	cmd.Wait()
 	if !bytes.Contains(output, expected) {
 		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
 	}
+}
+
+func TestTraceEBPF3(t *testing.T) {
+	if os.Getenv("CI") == "true" {
+		t.Skip("cannot run test in CI, requires kernel compiled with btf support")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("not implemented on non linux/amd64 systems")
+	}
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 16) {
+		t.Skip("requires at least Go 1.16 to run test")
+	}
+	usr, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usr.Uid != "0" {
+		t.Skip("test must be run as root")
+	}
+
+	dlvbin := getDlvBinEBPF(t)
+
+	expected := []byte(`> (1) main.tracedFunction(0)
+> (1) main.tracedFunction(1)
+> (1) main.tracedFunction(2)
+> (1) main.tracedFunction(3)
+> (1) main.tracedFunction(4)
+> (1) main.tracedFunction(5)
+> (1) main.tracedFunction(6)
+> (1) main.tracedFunction(7)
+> (1) main.tracedFunction(8)
+> (1) main.tracedFunction(9)`)
+
+	fixtures := protest.FindFixturesDir()
+	cmd := exec.Command(dlvbin, "trace", "--ebpf", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "ebpf_trace2.go"), "main.traced")
+	rdr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stderr pipe")
+	defer rdr.Close()
+
+	assertNoError(cmd.Start(), t, "running trace")
+
+	output, err := ioutil.ReadAll(rdr)
+	assertNoError(err, t, "ReadAll")
+
 	cmd.Wait()
+	if !bytes.Contains(output, expected) {
+		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
+	}
+}
+
+func TestTraceEBPF4(t *testing.T) {
+	if os.Getenv("CI") == "true" {
+		t.Skip("cannot run test in CI, requires kernel compiled with btf support")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("not implemented on non linux/amd64 systems")
+	}
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 16) {
+		t.Skip("requires at least Go 1.16 to run test")
+	}
+	usr, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usr.Uid != "0" {
+		t.Skip("test must be run as root")
+	}
+
+	dlvbin := getDlvBinEBPF(t)
+
+	expected := []byte(`> (1) main.tracedFunction(0, true, 97)
+> (1) main.tracedFunction(1, false, 98)
+> (1) main.tracedFunction(2, false, 99)
+> (1) main.tracedFunction(3, false, 100)
+> (1) main.tracedFunction(4, false, 101)
+> (1) main.tracedFunction(5, true, 102)
+> (1) main.tracedFunction(6, false, 103)
+> (1) main.tracedFunction(7, false, 104)
+> (1) main.tracedFunction(8, false, 105)
+> (1) main.tracedFunction(9, false, 106)`)
+
+	fixtures := protest.FindFixturesDir()
+	cmd := exec.Command(dlvbin, "trace", "--ebpf", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "ebpf_trace3.go"), "main.traced")
+	rdr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stderr pipe")
+	defer rdr.Close()
+
+	assertNoError(cmd.Start(), t, "running trace")
+
+	output, err := ioutil.ReadAll(rdr)
+	assertNoError(err, t, "ReadAll")
+
+	cmd.Wait()
+	if !bytes.Contains(output, expected) {
+		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
+	}
 }
 
 func TestDlvTestChdir(t *testing.T) {
@@ -1326,4 +1326,40 @@ func TestStaticcheck(t *testing.T) {
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
 	out, _ := cmd.CombinedOutput()
 	checkAutogenDoc(t, "_scripts/staticcheck-out.txt", fmt.Sprintf("staticcheck %s > _scripts/staticcheck-out.txt", strings.Join(args, " ")), out)
+}
+
+func TestDefaultBinary(t *testing.T) {
+	// Check that when delve is run twice in the same directory simultaneously
+	// it will pick different default output binary paths.
+	dlvbin := getDlvBin(t)
+	fixture := filepath.Join(protest.FindFixturesDir(), "testargs.go")
+
+	startOne := func() (io.WriteCloser, func() error, *bytes.Buffer) {
+		cmd := exec.Command(dlvbin, "debug", "--allow-non-terminal-interactive=true", fixture, "--", "test")
+		stdin, _ := cmd.StdinPipe()
+		stdoutBuf := new(bytes.Buffer)
+		cmd.Stdout = stdoutBuf
+
+		assertNoError(cmd.Start(), t, "dlv debug")
+		return stdin, cmd.Wait, stdoutBuf
+	}
+
+	stdin1, wait1, stdoutBuf1 := startOne()
+	defer stdin1.Close()
+
+	stdin2, wait2, stdoutBuf2 := startOne()
+	defer stdin2.Close()
+
+	fmt.Fprintf(stdin1, "continue\nquit\n")
+	fmt.Fprintf(stdin2, "continue\nquit\n")
+
+	wait1()
+	wait2()
+
+	out1, out2 := stdoutBuf1.String(), stdoutBuf2.String()
+	t.Logf("%q", out1)
+	t.Logf("%q", out2)
+	if out1 == out2 {
+		t.Errorf("outputs match")
+	}
 }

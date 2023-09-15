@@ -8,9 +8,9 @@ import (
 
 var (
 	MinSupportedVersionOfGoMajor = 1
-	MinSupportedVersionOfGoMinor = 18
+	MinSupportedVersionOfGoMinor = 19
 	MaxSupportedVersionOfGoMajor = 1
-	MaxSupportedVersionOfGoMinor = 20
+	MaxSupportedVersionOfGoMinor = 21
 	goTooOldErr                  = fmt.Sprintf("Go version %%s is too old for this version of Delve (minimum supported version %d.%d, suppress this error with --check-go-version=false)", MinSupportedVersionOfGoMajor, MinSupportedVersionOfGoMinor)
 	goTooOldWarn                 = fmt.Sprintf("WARNING: undefined behavior - Go version %%s is too old for this version of Delve (minimum supported version %d.%d)", MinSupportedVersionOfGoMajor, MinSupportedVersionOfGoMinor)
 	dlvTooOldErr                 = fmt.Sprintf("Version of Delve is too old for Go version %%s (maximum supported version %d.%d, suppress this error with --check-go-version=false)", MaxSupportedVersionOfGoMajor, MaxSupportedVersionOfGoMinor)
@@ -24,20 +24,19 @@ func Compatible(producer string, warnonly bool) error {
 	if ver.IsDevel() {
 		return nil
 	}
-	verstr := fmt.Sprintf("%d.%d.%d", ver.Major, ver.Minor, ver.Rev)
-	if !ver.AfterOrEqual(GoVersion{MinSupportedVersionOfGoMajor, MinSupportedVersionOfGoMinor, -1, 0, 0, ""}) {
+	if !ver.AfterOrEqual(GoVersion{MinSupportedVersionOfGoMajor, MinSupportedVersionOfGoMinor, betaRev(0), "", ""}) {
 		if warnonly {
-			logflags.WriteError(fmt.Sprintf(goTooOldWarn, verstr))
+			logflags.WriteError(fmt.Sprintf(goTooOldWarn, ver.String()))
 			return nil
 		}
-		return fmt.Errorf(goTooOldErr, verstr)
+		return fmt.Errorf(goTooOldErr, ver.String())
 	}
-	if ver.AfterOrEqual(GoVersion{MaxSupportedVersionOfGoMajor, MaxSupportedVersionOfGoMinor + 1, -1, 0, 0, ""}) {
+	if ver.AfterOrEqual(GoVersion{MaxSupportedVersionOfGoMajor, MaxSupportedVersionOfGoMinor + 1, betaRev(0), "", ""}) {
 		if warnonly {
-			logflags.WriteError(fmt.Sprintf(dlvTooOldWarn, verstr))
+			logflags.WriteError(fmt.Sprintf(dlvTooOldWarn, ver.String()))
 			return nil
 		}
-		return fmt.Errorf(dlvTooOldErr, verstr)
+		return fmt.Errorf(dlvTooOldErr, ver.String())
 	}
 	return nil
 }

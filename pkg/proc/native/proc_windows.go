@@ -3,11 +3,14 @@ package native
 import (
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
+	"unicode/utf16"
 	"unsafe"
 
 	sys "golang.org/x/sys/windows"
 
+	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 )
@@ -23,12 +26,12 @@ type osProcessDetails struct {
 func (os *osProcessDetails) Close() {}
 
 // Launch creates and begins debugging a new process.
-func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, redirects [3]string) (*proc.TargetGroup, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, stdinPath string, stdoutOR proc.OutputRedirect, stderrOR proc.OutputRedirect) (*proc.TargetGroup, error) {
 	argv0Go := cmd[0]
 
 	env := proc.DisableAsyncPreemptEnv()
 
-	stdin, stdout, stderr, closefn, err := openRedirects(redirects, true)
+	stdin, stdout, stderr, closefn, err := openRedirects(stdinPath, stdoutOR, stderrOR, true)
 	if err != nil {
 		return nil, err
 	}
@@ -62,13 +65,13 @@ func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ strin
 
 	tgt, err := dbp.initialize(argv0Go, []string{})
 	if err != nil {
-		dbp.Detach(true)
+		detachWithoutGroup(dbp, true)
 		return nil, err
 	}
 	return tgt, nil
 }
 
-func initialize(dbp *nativeProcess) error {
+func initialize(dbp *nativeProcess) (string, error) {
 	// It should not actually be possible for the
 	// call to waitForDebugEvent to fail, since Windows
 	// will always fire a CREATE_PROCESS_DEBUG_EVENT event
@@ -80,19 +83,22 @@ func initialize(dbp *nativeProcess) error {
 		tid, exitCode, err = dbp.waitForDebugEvent(waitBlocking)
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	if tid == 0 {
 		dbp.postExit()
-		return proc.ErrProcessExited{Pid: dbp.pid, Status: exitCode}
+		return "", proc.ErrProcessExited{Pid: dbp.pid, Status: exitCode}
 	}
+
+	cmdline := getCmdLine(dbp.os.hProcess)
+
 	// Suspend all threads so that the call to _ContinueDebugEvent will
 	// not resume the target.
 	for _, thread := range dbp.threads {
 		if !thread.os.dbgUiRemoteBreakIn {
 			_, err := _SuspendThread(thread.os.hThread)
 			if err != nil {
-				return err
+				return "", err
 			}
 		}
 	}
@@ -100,10 +106,10 @@ func initialize(dbp *nativeProcess) error {
 	dbp.execPtraceFunc(func() {
 		err = _ContinueDebugEvent(uint32(dbp.pid), uint32(dbp.os.breakThread), _DBG_CONTINUE)
 	})
-	return err
+	return cmdline, err
 }
 
-// findExePath searches for process pid, and returns its executable path.
+// findExePath searches for process pid, and returns its executable path
 func findExePath(pid int) (string, error) {
 	// Original code suggested different approach (see below).
 	// Maybe it could be useful in the future.
@@ -140,7 +146,7 @@ func findExePath(pid int) (string, error) {
 var debugPrivilegeRequested = false
 
 // Attach to an existing process with the given PID.
-func Attach(pid int, _ []string) (*proc.TargetGroup, error) {
+func Attach(pid int, waitFor *proc.WaitFor, _ []string) (*proc.TargetGroup, error) {
 	var aperr error
 	if !debugPrivilegeRequested {
 		debugPrivilegeRequested = true
@@ -149,6 +155,14 @@ func Attach(pid int, _ []string) (*proc.TargetGroup, error) {
 		// Since this privilege is not needed to debug processes owned by the
 		// current user, do not complain about this unless attach actually fails.
 		aperr = acquireDebugPrivilege()
+	}
+
+	if waitFor.Valid() {
+		var err error
+		pid, err = WaitFor(waitFor)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	dbp := newProcess(pid)
@@ -169,7 +183,7 @@ func Attach(pid int, _ []string) (*proc.TargetGroup, error) {
 	}
 	tgt, err := dbp.initialize(exepath, []string{})
 	if err != nil {
-		dbp.Detach(true)
+		detachWithoutGroup(dbp, true)
 		return nil, err
 	}
 	return tgt, nil
@@ -209,8 +223,45 @@ func acquireDebugPrivilege() error {
 	return nil
 }
 
+func waitForSearchProcess(pfx string, seen map[int]struct{}) (int, error) {
+	log := logflags.DebuggerLogger()
+	handle, err := sys.CreateToolhelp32Snapshot(sys.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0, fmt.Errorf("could not get process list: %v", err)
+	}
+	defer sys.CloseHandle(handle)
+
+	var entry sys.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	err = sys.Process32First(handle, &entry)
+	if err != nil {
+		return 0, fmt.Errorf("could not get process list: %v", err)
+	}
+
+	for err = sys.Process32First(handle, &entry); err == nil; err = sys.Process32Next(handle, &entry) {
+		if _, isseen := seen[int(entry.ProcessID)]; isseen {
+			continue
+		}
+		seen[int(entry.ProcessID)] = struct{}{}
+
+		hProcess, err := sys.OpenProcess(sys.PROCESS_QUERY_INFORMATION|sys.PROCESS_VM_READ, false, entry.ProcessID)
+		if err != nil {
+			continue
+		}
+		cmdline := getCmdLine(syscall.Handle(hProcess))
+		sys.CloseHandle(hProcess)
+
+		log.Debugf("waitfor: new process %q", cmdline)
+		if strings.HasPrefix(cmdline, pfx) {
+			return int(entry.ProcessID), nil
+		}
+	}
+
+	return 0, nil
+}
+
 // kill kills the process.
-func (dbp *nativeProcess) kill() error {
+func (procgrp *processGroup) kill(dbp *nativeProcess) error {
 	if dbp.exited {
 		return nil
 	}
@@ -445,15 +496,12 @@ func trapWait(procgrp *processGroup, pid int) (*nativeThread, error) {
 	return th, nil
 }
 
-func (dbp *nativeProcess) wait(pid, options int) (int, *sys.WaitStatus, error) {
-	return 0, nil, fmt.Errorf("not implemented: wait")
-}
-
 func (dbp *nativeProcess) exitGuard(err error) error {
 	return err
 }
 
-func (dbp *nativeProcess) resume() error {
+func (procgrp *processGroup) resume() error {
+	dbp := procgrp.procs[0]
 	for _, thread := range dbp.threads {
 		if thread.CurrentBreakpoint.Breakpoint != nil {
 			if err := thread.StepInstruction(); err != nil {
@@ -602,6 +650,129 @@ func (dbp *nativeProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf
 
 func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
 	return nil
+}
+
+type _PROCESS_BASIC_INFORMATION struct {
+	ExitStatus                   sys.NTStatus
+	PebBaseAddress               uintptr
+	AffinityMask                 uintptr
+	BasePriority                 int32
+	UniqueProcessId              uintptr
+	InheritedFromUniqueProcessId uintptr
+}
+
+type _PEB struct {
+	reserved1              [2]byte
+	BeingDebugged          byte
+	BitField               byte
+	reserved3              uintptr
+	ImageBaseAddress       uintptr
+	Ldr                    uintptr
+	ProcessParameters      uintptr
+	reserved4              [3]uintptr
+	AtlThunkSListPtr       uintptr
+	reserved5              uintptr
+	reserved6              uint32
+	reserved7              uintptr
+	reserved8              uint32
+	AtlThunkSListPtr32     uint32
+	reserved9              [45]uintptr
+	reserved10             [96]byte
+	PostProcessInitRoutine uintptr
+	reserved11             [128]byte
+	reserved12             [1]uintptr
+	SessionId              uint32
+}
+
+type _RTL_USER_PROCESS_PARAMETERS struct {
+	MaximumLength, Length uint32
+
+	Flags, DebugFlags uint32
+
+	ConsoleHandle                                sys.Handle
+	ConsoleFlags                                 uint32
+	StandardInput, StandardOutput, StandardError sys.Handle
+
+	CurrentDirectory struct {
+		DosPath _NTUnicodeString
+		Handle  sys.Handle
+	}
+
+	DllPath       _NTUnicodeString
+	ImagePathName _NTUnicodeString
+	CommandLine   _NTUnicodeString
+	Environment   unsafe.Pointer
+
+	StartingX, StartingY, CountX, CountY, CountCharsX, CountCharsY, FillAttribute uint32
+
+	WindowFlags, ShowWindowFlags                     uint32
+	WindowTitle, DesktopInfo, ShellInfo, RuntimeData _NTUnicodeString
+	CurrentDirectories                               [32]struct {
+		Flags     uint16
+		Length    uint16
+		TimeStamp uint32
+		DosPath   _NTString
+	}
+
+	EnvironmentSize, EnvironmentVersion uintptr
+
+	PackageDependencyData uintptr
+	ProcessGroupId        uint32
+	LoaderThreads         uint32
+
+	RedirectionDllName               _NTUnicodeString
+	HeapPartitionName                _NTUnicodeString
+	DefaultThreadpoolCpuSetMasks     uintptr
+	DefaultThreadpoolCpuSetMaskCount uint32
+}
+
+type _NTString struct {
+	Length        uint16
+	MaximumLength uint16
+	Buffer        uintptr
+}
+
+type _NTUnicodeString struct {
+	Length        uint16
+	MaximumLength uint16
+	Buffer        uintptr
+}
+
+func getCmdLine(hProcess syscall.Handle) string {
+	logger := logflags.DebuggerLogger()
+	var info _PROCESS_BASIC_INFORMATION
+	err := sys.NtQueryInformationProcess(sys.Handle(hProcess), sys.ProcessBasicInformation, unsafe.Pointer(&info), uint32(unsafe.Sizeof(info)), nil)
+	if err != nil {
+		logger.Errorf("NtQueryInformationProcess: %v", err)
+		return ""
+	}
+	var peb _PEB
+	err = _ReadProcessMemory(hProcess, info.PebBaseAddress, (*byte)(unsafe.Pointer(&peb)), unsafe.Sizeof(peb), nil)
+	if err != nil {
+		logger.Errorf("Reading PEB: %v", err)
+		return ""
+	}
+	var upp _RTL_USER_PROCESS_PARAMETERS
+	err = _ReadProcessMemory(hProcess, peb.ProcessParameters, (*byte)(unsafe.Pointer(&upp)), unsafe.Sizeof(upp), nil)
+	if err != nil {
+		logger.Errorf("Reading ProcessParameters: %v", err)
+		return ""
+	}
+	if upp.CommandLine.Length%2 != 0 {
+		logger.Errorf("CommandLine length not a multiple of 2")
+		return ""
+	}
+	buf := make([]byte, upp.CommandLine.Length)
+	err = _ReadProcessMemory(hProcess, upp.CommandLine.Buffer, &buf[0], uintptr(len(buf)), nil)
+	if err != nil {
+		logger.Errorf("Reading CommandLine: %v", err)
+		return ""
+	}
+	utf16buf := make([]uint16, len(buf)/2)
+	for i := 0; i < len(buf); i += 2 {
+		utf16buf[i/2] = uint16(buf[i+1])<<8 + uint16(buf[i])
+	}
+	return string(utf16.Decode(utf16buf))
 }
 
 func killProcess(pid int) error {

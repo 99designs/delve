@@ -1,8 +1,10 @@
 package native
 
 import (
+	"errors"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/go-delve/delve/pkg/proc"
 )
@@ -69,6 +71,23 @@ func newChildProcess(dbp *nativeProcess, pid int) *nativeProcess {
 	}
 }
 
+// WaitFor waits for a process as specified by waitFor.
+func WaitFor(waitFor *proc.WaitFor) (int, error) {
+	t0 := time.Now()
+	seen := make(map[int]struct{})
+	for (waitFor.Duration == 0) || (time.Since(t0) < waitFor.Duration) {
+		pid, err := waitForSearchProcess(waitFor.Name, seen)
+		if err != nil {
+			return 0, err
+		}
+		if pid != 0 {
+			return pid, nil
+		}
+		time.Sleep(waitFor.Interval)
+	}
+	return 0, errors.New("waitfor duration expired")
+}
+
 // BinInfo will return the binary info struct associated with this process.
 func (dbp *nativeProcess) BinInfo() *proc.BinaryInfo {
 	return dbp.bi
@@ -77,17 +96,24 @@ func (dbp *nativeProcess) BinInfo() *proc.BinaryInfo {
 // StartCallInjection notifies the backend that we are about to inject a function call.
 func (dbp *nativeProcess) StartCallInjection() (func(), error) { return func() {}, nil }
 
+// detachWithoutGroup is a helper function to detach from a process which we
+// haven't added to a process group yet.
+func detachWithoutGroup(dbp *nativeProcess, kill bool) error {
+	grp := &processGroup{procs: []*nativeProcess{dbp}}
+	return grp.Detach(dbp.pid, kill)
+}
+
 // Detach from the process being debugged, optionally killing it.
-func (dbp *nativeProcess) Detach(kill bool) (err error) {
+func (procgrp *processGroup) Detach(pid int, kill bool) (err error) {
+	dbp := procgrp.procForPid(pid)
 	if dbp.exited {
 		return nil
 	}
 	if kill && dbp.childProcess {
-		err := dbp.kill()
+		err := procgrp.kill(dbp)
 		if err != nil {
 			return err
 		}
-		dbp.bi.Close()
 		return nil
 	}
 	dbp.execPtraceFunc(func() {
@@ -207,12 +233,31 @@ func (procgrp *processGroup) procForThread(tid int) *nativeProcess {
 	return nil
 }
 
-func (procgrp *processGroup) add(p *nativeProcess, pid int, currentThread proc.Thread, path string, stopReason proc.StopReason) (*proc.Target, error) {
-	tgt, err := procgrp.addTarget(p, pid, currentThread, path, stopReason)
+func (procgrp *processGroup) procForPid(pid int) *nativeProcess {
+	for _, p := range procgrp.procs {
+		if p.pid == pid {
+			return p
+		}
+	}
+	return nil
+}
+
+func (procgrp *processGroup) add(p *nativeProcess, pid int, currentThread proc.Thread, path string, stopReason proc.StopReason, cmdline string) (*proc.Target, error) {
+	tgt, err := procgrp.addTarget(p, pid, currentThread, path, stopReason, cmdline)
+	if tgt == nil {
+		i := len(procgrp.procs)
+		procgrp.procs = append(procgrp.procs, p)
+		procgrp.Detach(p.pid, false)
+		if i == len(procgrp.procs)-1 {
+			procgrp.procs = procgrp.procs[:i]
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	procgrp.procs = append(procgrp.procs, p)
+	if tgt != nil {
+		procgrp.procs = append(procgrp.procs, p)
+	}
 	return tgt, nil
 }
 
@@ -225,15 +270,15 @@ func (procgrp *processGroup) ContinueOnce(cctx *proc.ContinueOnceContext) (proc.
 	}
 
 	for {
+		err := procgrp.resume()
+		if err != nil {
+			return nil, proc.StopUnknown, err
+		}
 		for _, dbp := range procgrp.procs {
-			if dbp.exited {
-				continue
-			}
-			if err := dbp.resume(); err != nil {
-				return nil, proc.StopUnknown, err
-			}
-			for _, th := range dbp.threads {
-				th.CurrentBreakpoint.Clear()
+			if valid, _ := dbp.Valid(); valid {
+				for _, th := range dbp.threads {
+					th.CurrentBreakpoint.Clear()
+				}
 			}
 		}
 
@@ -285,20 +330,24 @@ func (dbp *nativeProcess) FindBreakpoint(pc uint64, adjustPC bool) (*proc.Breakp
 	return nil, false
 }
 
-func (dbp *nativeProcess) initializeBasic() error {
-	if err := initialize(dbp); err != nil {
-		return err
+func (dbp *nativeProcess) initializeBasic() (string, error) {
+	cmdline, err := initialize(dbp)
+	if err != nil {
+		return "", err
 	}
 	if err := dbp.updateThreadList(); err != nil {
-		return err
+		return "", err
 	}
-	return nil
+	return cmdline, nil
 }
 
 // initialize will ensure that all relevant information is loaded
 // so the process is ready to be debugged.
 func (dbp *nativeProcess) initialize(path string, debugInfoDirs []string) (*proc.TargetGroup, error) {
-	dbp.initializeBasic()
+	cmdline, err := dbp.initializeBasic()
+	if err != nil {
+		return nil, err
+	}
 	stopReason := proc.StopLaunched
 	if !dbp.childProcess {
 		stopReason = proc.StopAttached
@@ -315,17 +364,21 @@ func (dbp *nativeProcess) initialize(path string, debugInfoDirs []string) (*proc
 		//    look like the breakpoint was hit twice when it was "logically" only
 		//    executed once.
 		//    See: https://go-review.googlesource.com/c/go/+/208126
-		DisableAsyncPreempt: runtime.GOOS == "windows" || (runtime.GOOS == "linux" && runtime.GOARCH == "arm64"),
+		//	- on linux/ppc64le according to @laboger, they had issues in the past
+		//	  with gdb once AsyncPreempt was enabled. While implementing the port,
+		//	  few tests failed while it was enabled, but cannot be warrantied that
+		//	  disabling it fixed the issues.
+		DisableAsyncPreempt: runtime.GOOS == "windows" || (runtime.GOOS == "linux" && runtime.GOARCH == "arm64") || (runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le"),
 
 		StopReason: stopReason,
-		CanDump:    runtime.GOOS == "linux" || (runtime.GOOS == "windows" && runtime.GOARCH == "amd64"),
+		CanDump:    runtime.GOOS == "linux" || runtime.GOOS == "freebsd" || (runtime.GOOS == "windows" && runtime.GOARCH == "amd64"),
 	})
 	procgrp.addTarget = addTarget
-	tgt, err := procgrp.add(dbp, dbp.pid, dbp.memthread, path, stopReason)
+	tgt, err := procgrp.add(dbp, dbp.pid, dbp.memthread, path, stopReason, cmdline)
 	if err != nil {
 		return nil, err
 	}
-	if dbp.bi.Arch.Name == "arm64" {
+	if dbp.bi.Arch.Name == "arm64" || dbp.bi.Arch.Name == "ppc64le" {
 		dbp.iscgo = tgt.IsCgo()
 	}
 	return grp, nil
@@ -348,6 +401,7 @@ func (pt *ptraceThread) handlePtraceFuncs() {
 		fn()
 		pt.ptraceDoneChan <- nil
 	}
+	close(pt.ptraceDoneChan)
 }
 
 func (dbp *nativeProcess) execPtraceFunc(fn func()) {
@@ -370,11 +424,11 @@ func (dbp *nativeProcess) writeSoftwareBreakpoint(thread *nativeThread, addr uin
 	return err
 }
 
-func openRedirects(redirects [3]string, foreground bool) (stdin, stdout, stderr *os.File, closefn func(), err error) {
+func openRedirects(stdinPath string, stdoutOR proc.OutputRedirect, stderrOR proc.OutputRedirect, foreground bool) (stdin, stdout, stderr *os.File, closefn func(), err error) {
 	toclose := []*os.File{}
 
-	if redirects[0] != "" {
-		stdin, err = os.Open(redirects[0])
+	if stdinPath != "" {
+		stdin, err = os.Open(stdinPath)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -383,24 +437,29 @@ func openRedirects(redirects [3]string, foreground bool) (stdin, stdout, stderr 
 		stdin = os.Stdin
 	}
 
-	create := func(path string, dflt *os.File) *os.File {
-		if path == "" {
-			return dflt
+	create := func(redirect proc.OutputRedirect, dflt *os.File) (f *os.File) {
+		if redirect.Path != "" {
+			f, err = os.Create(redirect.Path)
+			if f != nil {
+				toclose = append(toclose, f)
+			}
+
+			return f
+		} else if redirect.File != nil {
+			toclose = append(toclose, redirect.File)
+
+			return redirect.File
 		}
-		var f *os.File
-		f, err = os.Create(path)
-		if f != nil {
-			toclose = append(toclose, f)
-		}
-		return f
+
+		return dflt
 	}
 
-	stdout = create(redirects[1], os.Stdout)
+	stdout = create(stdoutOR, os.Stdout)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 
-	stderr = create(redirects[2], os.Stderr)
+	stderr = create(stderrOR, os.Stderr)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -439,6 +498,5 @@ func (pt *ptraceThread) release() {
 	pt.ptraceRefCnt--
 	if pt.ptraceRefCnt == 0 {
 		close(pt.ptraceChan)
-		close(pt.ptraceDoneChan)
 	}
 }

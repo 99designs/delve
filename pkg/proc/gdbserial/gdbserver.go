@@ -77,6 +77,8 @@ import (
 	"sync"
 	"time"
 
+	isatty "github.com/mattn/go-isatty"
+
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/elfwriter"
 	"github.com/go-delve/delve/pkg/logflags"
@@ -84,7 +86,6 @@ import (
 	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 	"github.com/go-delve/delve/pkg/proc/linutil"
 	"github.com/go-delve/delve/pkg/proc/macutil"
-	isatty "github.com/mattn/go-isatty"
 )
 
 const (
@@ -278,7 +279,7 @@ func newProcess(process *os.Process) *gdbProcess {
 }
 
 // Listen waits for a connection from the stub.
-func (p *gdbProcess) Listen(listener net.Listener, path string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
+func (p *gdbProcess) Listen(listener net.Listener, path, cmdline string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
 	acceptChan := make(chan net.Conn)
 
 	go func() {
@@ -292,7 +293,7 @@ func (p *gdbProcess) Listen(listener net.Listener, path string, pid int, debugIn
 		if conn == nil {
 			return nil, errors.New("could not connect")
 		}
-		return p.Connect(conn, path, pid, debugInfoDirs, stopReason)
+		return p.Connect(conn, path, cmdline, pid, debugInfoDirs, stopReason)
 	case status := <-p.waitChan:
 		listener.Close()
 		return nil, fmt.Errorf("stub exited while waiting for connection: %v", status)
@@ -300,11 +301,11 @@ func (p *gdbProcess) Listen(listener net.Listener, path string, pid int, debugIn
 }
 
 // Dial attempts to connect to the stub.
-func (p *gdbProcess) Dial(addr string, path string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
+func (p *gdbProcess) Dial(addr string, path, cmdline string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
 	for {
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
-			return p.Connect(conn, path, pid, debugInfoDirs, stopReason)
+			return p.Connect(conn, path, cmdline, pid, debugInfoDirs, stopReason)
 		}
 		select {
 		case status := <-p.waitChan:
@@ -321,7 +322,7 @@ func (p *gdbProcess) Dial(addr string, path string, pid int, debugInfoDirs []str
 // program and the PID of the target process, both are optional, however
 // some stubs do not provide ways to determine path and pid automatically
 // and Connect will be unable to function without knowing them.
-func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
+func (p *gdbProcess) Connect(conn net.Conn, path, cmdline string, pid int, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
 	p.conn.conn = conn
 	p.conn.pid = pid
 	err := p.conn.handshake(p.regnames)
@@ -345,7 +346,7 @@ func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs 
 		p.gcmdok = false
 	}
 
-	tgt, err := p.initialize(path, debugInfoDirs, stopReason)
+	tgt, err := p.initialize(path, cmdline, debugInfoDirs, stopReason)
 	if err != nil {
 		return nil, err
 	}
@@ -375,11 +376,11 @@ func (p *gdbProcess) SupportsBPF() bool {
 	return false
 }
 
-func (dbp *gdbProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
+func (p *gdbProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
 	return nil
 }
 
-func (dbp *gdbProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+func (p *gdbProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
 	panic("not implemented")
 }
 
@@ -569,9 +570,9 @@ func LLDBLaunch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs [
 
 	var grp *proc.TargetGroup
 	if listener != nil {
-		grp, err = p.Listen(listener, cmd[0], 0, debugInfoDirs, proc.StopLaunched)
+		grp, err = p.Listen(listener, cmd[0], strings.Join(cmd, " "), 0, debugInfoDirs, proc.StopLaunched)
 	} else {
-		grp, err = p.Dial(port, cmd[0], 0, debugInfoDirs, proc.StopLaunched)
+		grp, err = p.Dial(port, cmd[0], strings.Join(cmd, " "), 0, debugInfoDirs, proc.StopLaunched)
 	}
 	if p.conn.pid != 0 && foreground && isatty.IsTerminal(os.Stdin.Fd()) {
 		// Make the target process the controlling process of the tty if it is a foreground process.
@@ -588,7 +589,7 @@ func LLDBLaunch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs [
 // Path is path to the target's executable, path only needs to be specified
 // for some stubs that do not provide an automated way of determining it
 // (for example debugserver).
-func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.TargetGroup, error) {
+func LLDBAttach(pid int, path string, waitFor *proc.WaitFor, debugInfoDirs []string) (*proc.TargetGroup, error) {
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
 	}
@@ -609,12 +610,28 @@ func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.TargetGroup
 		if err != nil {
 			return nil, err
 		}
-		args := []string{"-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port), "--attach=" + strconv.Itoa(pid)}
+		args := []string{"-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port)}
+
+		if waitFor.Valid() {
+			duration := int(waitFor.Duration.Seconds())
+			if duration == 0 && waitFor.Duration != 0 {
+				// If duration is below the (second) resolution of debugserver pass 1
+				// second (0 means infinite).
+				duration = 1
+			}
+			args = append(args, "--waitfor="+waitFor.Name, fmt.Sprintf("--waitfor-interval=%d", waitFor.Interval.Microseconds()), fmt.Sprintf("--waitfor-duration=%d", duration))
+		} else {
+			args = append(args, "--attach="+strconv.Itoa(pid))
+		}
+
 		if canUnmaskSignals(debugserverExecutable) {
 			args = append(args, "--unmask-signals")
 		}
 		process = commandLogger(debugserverExecutable, args...)
 	} else {
+		if waitFor.Valid() {
+			return nil, proc.ErrWaitForNotImplemented
+		}
 		if _, err = exec.LookPath("lldb-server"); err != nil {
 			return nil, &ErrBackendUnavailable{}
 		}
@@ -635,9 +652,9 @@ func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.TargetGroup
 
 	var grp *proc.TargetGroup
 	if listener != nil {
-		grp, err = p.Listen(listener, path, pid, debugInfoDirs, proc.StopAttached)
+		grp, err = p.Listen(listener, path, "", pid, debugInfoDirs, proc.StopAttached)
 	} else {
-		grp, err = p.Dial(port, path, pid, debugInfoDirs, proc.StopAttached)
+		grp, err = p.Dial(port, path, "", pid, debugInfoDirs, proc.StopAttached)
 	}
 	return grp, err
 }
@@ -646,7 +663,7 @@ func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.TargetGroup
 // debugging PIEs.
 func (p *gdbProcess) EntryPoint() (uint64, error) {
 	var entryPoint uint64
-	if p.bi.GOOS == "darwin" && p.bi.Arch.Name == "arm64" {
+	if p.bi.GOOS == "darwin" {
 		// There is no auxv on darwin, however, we can get the location of the mach-o
 		// header from the debugserver by going through the loaded libraries, which includes
 		// the exe itself
@@ -673,7 +690,7 @@ func (p *gdbProcess) EntryPoint() (uint64, error) {
 // initialize uses qProcessInfo to load the inferior's PID and
 // executable path. This command is not supported by all stubs and not all
 // stubs will report both the PID and executable path.
-func (p *gdbProcess) initialize(path string, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
+func (p *gdbProcess) initialize(path, cmdline string, debugInfoDirs []string, stopReason proc.StopReason) (*proc.TargetGroup, error) {
 	var err error
 	if path == "" {
 		// If we are attaching to a running process and the user didn't specify
@@ -730,9 +747,9 @@ func (p *gdbProcess) initialize(path string, debugInfoDirs []string, stopReason 
 		StopReason:          stopReason,
 		CanDump:             runtime.GOOS == "darwin",
 	})
-	_, err = addTarget(p, p.conn.pid, p.currentThread, path, stopReason)
+	_, err = addTarget(p, p.conn.pid, p.currentThread, path, stopReason, cmdline)
 	if err != nil {
-		p.Detach(true)
+		p.Detach(p.conn.pid, true)
 		return nil, err
 	}
 	return grp, nil
@@ -1042,7 +1059,9 @@ func (p *gdbProcess) getCtrlC(cctx *proc.ContinueOnceContext) bool {
 
 // Detach will detach from the target process,
 // if 'kill' is true it will also kill the process.
-func (p *gdbProcess) Detach(kill bool) error {
+// The _pid argument is unused as follow exec
+// mode is not implemented with this backend.
+func (p *gdbProcess) Detach(_pid int, kill bool) error {
 	if kill && !p.exited {
 		err := p.conn.kill()
 		if err != nil {
@@ -1961,7 +1980,7 @@ func (regs *gdbRegisters) byName(name string) uint64 {
 	return binary.LittleEndian.Uint64(reg.value)
 }
 
-func (r *gdbRegisters) FloatLoadError() error {
+func (regs *gdbRegisters) FloatLoadError() error {
 	return nil
 }
 

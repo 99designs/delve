@@ -31,12 +31,13 @@ const goDictionaryName = ".dict"
 // current location (PC), and canonical frame address.
 type EvalScope struct {
 	Location
-	Regs    op.DwarfRegisters
-	Mem     MemoryReadWriter // Target's memory
-	g       *G
-	BinInfo *BinaryInfo
-	target  *Target
-	loadCfg *LoadConfig
+	Regs     op.DwarfRegisters
+	Mem      MemoryReadWriter // Target's memory
+	g        *G
+	threadID int
+	BinInfo  *BinaryInfo
+	target   *Target
+	loadCfg  *LoadConfig
 
 	frameOffset int64
 
@@ -78,6 +79,7 @@ func ConvertEvalScope(dbp *Target, gid int64, frame, deferCall int) (*EvalScope,
 		return nil, err
 	}
 	ct := dbp.CurrentThread()
+	threadID := ct.ThreadID()
 	g, err := FindGoroutine(dbp, gid)
 	if err != nil {
 		return nil, err
@@ -90,9 +92,12 @@ func ConvertEvalScope(dbp *Target, gid int64, frame, deferCall int) (*EvalScope,
 
 	var locs []Stackframe
 	if g != nil {
-		locs, err = g.Stacktrace(frame+1, opts)
+		if g.Thread != nil {
+			threadID = g.Thread.ThreadID()
+		}
+		locs, err = GoroutineStacktrace(dbp, g, frame+1, opts)
 	} else {
-		locs, err = ThreadStacktrace(ct, frame+1)
+		locs, err = ThreadStacktrace(dbp, ct, frame+1)
 	}
 	if err != nil {
 		return nil, err
@@ -115,7 +120,7 @@ func ConvertEvalScope(dbp *Target, gid int64, frame, deferCall int) (*EvalScope,
 		return d.EvalScope(dbp, ct)
 	}
 
-	return FrameToScope(dbp, dbp.Memory(), g, locs[frame:]...), nil
+	return FrameToScope(dbp, dbp.Memory(), g, threadID, locs[frame:]...), nil
 }
 
 // FrameToScope returns a new EvalScope for frames[0].
@@ -123,7 +128,7 @@ func ConvertEvalScope(dbp *Target, gid int64, frame, deferCall int) (*EvalScope,
 // frames[0].Regs.SP() and frames[1].Regs.CFA will be cached.
 // Otherwise all memory between frames[0].Regs.SP() and frames[0].Regs.CFA
 // will be cached.
-func FrameToScope(t *Target, thread MemoryReadWriter, g *G, frames ...Stackframe) *EvalScope {
+func FrameToScope(t *Target, thread MemoryReadWriter, g *G, threadID int, frames ...Stackframe) *EvalScope {
 	// Creates a cacheMem that will preload the entire stack frame the first
 	// time any local variable is read.
 	// Remember that the stack grows downward in memory.
@@ -138,26 +143,26 @@ func FrameToScope(t *Target, thread MemoryReadWriter, g *G, frames ...Stackframe
 		thread = cacheMemory(thread, minaddr, int(maxaddr-minaddr))
 	}
 
-	s := &EvalScope{Location: frames[0].Call, Regs: frames[0].Regs, Mem: thread, g: g, BinInfo: t.BinInfo(), target: t, frameOffset: frames[0].FrameOffset()}
+	s := &EvalScope{Location: frames[0].Call, Regs: frames[0].Regs, Mem: thread, g: g, BinInfo: t.BinInfo(), target: t, frameOffset: frames[0].FrameOffset(), threadID: threadID}
 	s.PC = frames[0].lastpc
 	return s
 }
 
 // ThreadScope returns an EvalScope for the given thread.
 func ThreadScope(t *Target, thread Thread) (*EvalScope, error) {
-	locations, err := ThreadStacktrace(thread, 1)
+	locations, err := ThreadStacktrace(t, thread, 1)
 	if err != nil {
 		return nil, err
 	}
 	if len(locations) < 1 {
 		return nil, errors.New("could not decode first frame")
 	}
-	return FrameToScope(t, thread.ProcessMemory(), nil, locations...), nil
+	return FrameToScope(t, thread.ProcessMemory(), nil, thread.ThreadID(), locations...), nil
 }
 
 // GoroutineScope returns an EvalScope for the goroutine running on the given thread.
 func GoroutineScope(t *Target, thread Thread) (*EvalScope, error) {
-	locations, err := ThreadStacktrace(thread, 1)
+	locations, err := ThreadStacktrace(t, thread, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +173,11 @@ func GoroutineScope(t *Target, thread Thread) (*EvalScope, error) {
 	if err != nil {
 		return nil, err
 	}
-	return FrameToScope(t, thread.ProcessMemory(), g, locations...), nil
+	threadID := 0
+	if g.Thread != nil {
+		threadID = g.Thread.ThreadID()
+	}
+	return FrameToScope(t, thread.ProcessMemory(), g, threadID, locations...), nil
 }
 
 // EvalExpression returns the value of the given expression.
@@ -203,6 +212,89 @@ func (scope *EvalScope) EvalExpression(expr string, cfg LoadConfig) (*Variable, 
 	}
 	scope.callCtx.doReturn(ev, nil)
 	return ev, nil
+}
+
+// ChanGoroutines returns the list of goroutines waiting to receive from or
+// send to the channel.
+func (scope *EvalScope) ChanGoroutines(expr string, start, count int) ([]int64, error) {
+	t, err := parser.ParseExpr(expr)
+	if err != nil {
+		return nil, err
+	}
+	v, err := scope.evalAST(t)
+	if err != nil {
+		return nil, err
+	}
+	if v.Kind != reflect.Chan {
+		return nil, nil
+	}
+
+	structMemberMulti := func(v *Variable, names ...string) *Variable {
+		for _, name := range names {
+			var err error
+			v, err = v.structMember(name)
+			if err != nil {
+				return nil
+			}
+		}
+		return v
+	}
+
+	waitqFirst := func(qname string) *Variable {
+		qvar := structMemberMulti(v, qname, "first")
+		if qvar == nil {
+			return nil
+		}
+		return qvar.maybeDereference()
+	}
+
+	var goids []int64
+
+	waitqToGoIDSlice := func(qvar *Variable) error {
+		if qvar == nil {
+			return nil
+		}
+		for {
+			if qvar.Addr == 0 {
+				return nil
+			}
+			if len(goids) > count {
+				return nil
+			}
+			goidVar := structMemberMulti(qvar, "g", "goid")
+			if goidVar == nil {
+				return nil
+			}
+			goidVar.loadValue(loadSingleValue)
+			if goidVar.Unreadable != nil {
+				return goidVar.Unreadable
+			}
+			goid, _ := constant.Int64Val(goidVar.Value)
+			if start > 0 {
+				start--
+			} else {
+				goids = append(goids, goid)
+			}
+
+			nextVar, err := qvar.structMember("next")
+			if err != nil {
+				return err
+			}
+			qvar = nextVar.maybeDereference()
+		}
+	}
+
+	recvqVar := waitqFirst("recvq")
+	err = waitqToGoIDSlice(recvqVar)
+	if err != nil {
+		return nil, err
+	}
+	sendqVar := waitqFirst("sendq")
+	err = waitqToGoIDSlice(sendqVar)
+	if err != nil {
+		return nil, err
+	}
+	return goids, nil
 }
 
 func isAssignment(err error) (int, bool) {
@@ -292,7 +384,7 @@ func (scope *EvalScope) Locals(flags localsFlags) ([]*Variable, error) {
 		depths = append(depths, depth)
 	}
 
-	if len(vars) <= 0 {
+	if len(vars) == 0 {
 		return vars, nil
 	}
 
@@ -363,7 +455,7 @@ func (scope *EvalScope) setValue(dstv, srcv *Variable, srcExpr string) error {
 
 	if srcv.Unreadable != nil {
 		//lint:ignore ST1005 backwards compatibility
-		return fmt.Errorf("Expression \"%s\" is unreadable: %v", srcExpr, srcv.Unreadable)
+		return fmt.Errorf("Expression %q is unreadable: %v", srcExpr, srcv.Unreadable)
 	}
 
 	// Numerical types
@@ -437,12 +529,12 @@ func (scope *EvalScope) SetVariable(name, value string) error {
 
 	if xv.Addr == 0 {
 		//lint:ignore ST1005 backwards compatibility
-		return fmt.Errorf("Can not assign to \"%s\"", name)
+		return fmt.Errorf("Can not assign to %q", name)
 	}
 
 	if xv.Unreadable != nil {
 		//lint:ignore ST1005 backwards compatibility
-		return fmt.Errorf("Expression \"%s\" is unreadable: %v", name, xv.Unreadable)
+		return fmt.Errorf("Expression %q is unreadable: %v", name, xv.Unreadable)
 	}
 
 	t, err = parser.ParseExpr(value)
@@ -604,17 +696,6 @@ func (scope *EvalScope) image() *Image {
 	return scope.BinInfo.funcToImage(scope.Fn)
 }
 
-// DwarfReader returns the DwarfReader containing the
-// Dwarf information for the target process.
-func (scope *EvalScope) DwarfReader() *reader.Reader {
-	return scope.image().DwarfReader()
-}
-
-// PtrSize returns the size of a pointer.
-func (scope *EvalScope) PtrSize() int {
-	return scope.BinInfo.Arch.PtrSize()
-}
-
 func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
 	switch node := t.(type) {
 	case *ast.CallExpr:
@@ -634,7 +715,7 @@ func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
 				if scope.g == nil {
 					typ, err := scope.BinInfo.findType("runtime.g")
 					if err != nil {
-						return nil, fmt.Errorf("blah: %v", err)
+						return nil, fmt.Errorf("could not find runtime.g: %v", err)
 					}
 					gvar := newVariable("curg", fakeAddressUnresolv, typ, scope.BinInfo, scope.Mem)
 					gvar.loaded = true
@@ -646,6 +727,8 @@ func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
 				return scope.g.variable.clone(), nil
 			} else if maybePkg.Name == "runtime" && node.Sel.Name == "frameoff" {
 				return newConstant(constant.MakeInt64(scope.frameOffset), scope.Mem), nil
+			} else if maybePkg.Name == "runtime" && node.Sel.Name == "threadid" {
+				return newConstant(constant.MakeInt64(int64(scope.threadID)), scope.Mem), nil
 			} else if v, err := scope.findGlobal(maybePkg.Name, node.Sel.Name); err == nil {
 				return v, nil
 			}
@@ -1400,7 +1483,7 @@ func (scope *EvalScope) evalTypeAssert(node *ast.TypeAssertExpr) (*Variable, err
 		return nil, err
 	}
 	if xv.Kind != reflect.Interface {
-		return nil, fmt.Errorf("expression \"%s\" not an interface", exprToString(node.X))
+		return nil, fmt.Errorf("expression %q not an interface", exprToString(node.X))
 	}
 	xv.loadInterface(0, false, loadFullValue)
 	if xv.Unreadable != nil {
@@ -1451,7 +1534,7 @@ func (scope *EvalScope) evalIndex(node *ast.IndexExpr) (*Variable, error) {
 		return nil, err
 	}
 
-	cantindex := fmt.Errorf("expression \"%s\" (%s) does not support indexing", exprToString(node.X), xev.TypeString())
+	cantindex := fmt.Errorf("expression %q (%s) does not support indexing", exprToString(node.X), xev.TypeString())
 
 	switch xev.Kind {
 	case reflect.Ptr:
@@ -1469,7 +1552,7 @@ func (scope *EvalScope) evalIndex(node *ast.IndexExpr) (*Variable, error) {
 
 	case reflect.Slice, reflect.Array, reflect.String:
 		if xev.Base == 0 {
-			return nil, fmt.Errorf("can not index \"%s\"", exprToString(node.X))
+			return nil, fmt.Errorf("can not index %q", exprToString(node.X))
 		}
 		n, err := idxev.asInt()
 		if err != nil {
@@ -1508,7 +1591,7 @@ func (scope *EvalScope) evalReslice(node *ast.SliceExpr) (*Variable, error) {
 		}
 		low, err = lowv.asInt()
 		if err != nil {
-			return nil, fmt.Errorf("can not convert \"%s\" to int: %v", exprToString(node.Low), err)
+			return nil, fmt.Errorf("can not convert %q to int: %v", exprToString(node.Low), err)
 		}
 	}
 
@@ -1521,14 +1604,14 @@ func (scope *EvalScope) evalReslice(node *ast.SliceExpr) (*Variable, error) {
 		}
 		high, err = highv.asInt()
 		if err != nil {
-			return nil, fmt.Errorf("can not convert \"%s\" to int: %v", exprToString(node.High), err)
+			return nil, fmt.Errorf("can not convert %q to int: %v", exprToString(node.High), err)
 		}
 	}
 
 	switch xev.Kind {
 	case reflect.Slice, reflect.Array, reflect.String:
 		if xev.Base == 0 {
-			return nil, fmt.Errorf("can not slice \"%s\"", exprToString(node.X))
+			return nil, fmt.Errorf("can not slice %q", exprToString(node.X))
 		}
 		return xev.reslice(low, high)
 	case reflect.Map:
@@ -1547,7 +1630,7 @@ func (scope *EvalScope) evalReslice(node *ast.SliceExpr) (*Variable, error) {
 		}
 		fallthrough
 	default:
-		return nil, fmt.Errorf("can not slice \"%s\" (type %s)", exprToString(node.X), xev.TypeString())
+		return nil, fmt.Errorf("can not slice %q (type %s)", exprToString(node.X), xev.TypeString())
 	}
 }
 
@@ -1559,7 +1642,7 @@ func (scope *EvalScope) evalPointerDeref(node *ast.StarExpr) (*Variable, error) 
 	}
 
 	if xev.Kind != reflect.Ptr {
-		return nil, fmt.Errorf("expression \"%s\" (%s) can not be dereferenced", exprToString(node.X), xev.TypeString())
+		return nil, fmt.Errorf("expression %q (%s) can not be dereferenced", exprToString(node.X), xev.TypeString())
 	}
 
 	if xev == nilVariable {
@@ -1592,7 +1675,7 @@ func (scope *EvalScope) evalAddrOf(node *ast.UnaryExpr) (*Variable, error) {
 		return nil, err
 	}
 	if xev.Addr == 0 || xev.DwarfType == nil {
-		return nil, fmt.Errorf("can not take address of \"%s\"", exprToString(node.X))
+		return nil, fmt.Errorf("can not take address of %q", exprToString(node.X))
 	}
 
 	return xev.pointerToVariable(), nil
@@ -1660,7 +1743,7 @@ func (scope *EvalScope) evalUnary(node *ast.UnaryExpr) (*Variable, error) {
 		return nil, errOperationOnSpecialFloat
 	}
 	if xv.Value == nil {
-		return nil, fmt.Errorf("operator %s can not be applied to \"%s\"", node.Op.String(), exprToString(node.X))
+		return nil, fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), exprToString(node.X))
 	}
 	rc, err := constantUnaryOp(node.Op, xv.Value)
 	if err != nil {
@@ -1708,7 +1791,7 @@ func negotiateType(op token.Token, xv, yv *Variable) (godwarf.Type, error) {
 
 	if xv.DwarfType != nil && yv.DwarfType != nil {
 		if xv.DwarfType.String() != yv.DwarfType.String() {
-			return nil, fmt.Errorf("mismatched types \"%s\" and \"%s\"", xv.DwarfType.String(), yv.DwarfType.String())
+			return nil, fmt.Errorf("mismatched types %q and %q", xv.DwarfType.String(), yv.DwarfType.String())
 		}
 		return xv.DwarfType, nil
 	} else if xv.DwarfType != nil && yv.DwarfType == nil {
@@ -1813,11 +1896,11 @@ func (scope *EvalScope) evalBinary(node *ast.BinaryExpr) (*Variable, error) {
 			yv.loadValue(loadFullValueLongerStrings)
 		}
 		if xv.Value == nil {
-			return nil, fmt.Errorf("operator %s can not be applied to \"%s\"", node.Op.String(), exprToString(node.X))
+			return nil, fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), exprToString(node.X))
 		}
 
 		if yv.Value == nil {
-			return nil, fmt.Errorf("operator %s can not be applied to \"%s\"", node.Op.String(), exprToString(node.Y))
+			return nil, fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), exprToString(node.Y))
 		}
 
 		rc, err := constantBinaryOp(op, xv.Value, yv.Value)
@@ -2280,8 +2363,8 @@ func (v *Variable) findMethod(mname string) (*Variable, error) {
 
 		//TODO(aarzilli): support generic functions?
 
-		if fn, ok := v.bi.LookupFunc[fmt.Sprintf("%s.%s.%s", pkg, receiver, mname)]; ok {
-			r, err := functionToVariable(fn, v.bi, v.mem)
+		if fns := v.bi.LookupFunc()[fmt.Sprintf("%s.%s.%s", pkg, receiver, mname)]; len(fns) == 1 {
+			r, err := functionToVariable(fns[0], v.bi, v.mem)
 			if err != nil {
 				return nil, err
 			}
@@ -2293,8 +2376,8 @@ func (v *Variable) findMethod(mname string) (*Variable, error) {
 			return r, nil
 		}
 
-		if fn, ok := v.bi.LookupFunc[fmt.Sprintf("%s.(*%s).%s", pkg, receiver, mname)]; ok {
-			r, err := functionToVariable(fn, v.bi, v.mem)
+		if fns := v.bi.LookupFunc()[fmt.Sprintf("%s.(*%s).%s", pkg, receiver, mname)]; len(fns) == 1 {
+			r, err := functionToVariable(fns[0], v.bi, v.mem)
 			if err != nil {
 				return nil, err
 			}

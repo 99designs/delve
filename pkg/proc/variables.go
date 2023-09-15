@@ -50,7 +50,7 @@ const (
 	FloatIsNormal floatSpecial = iota
 	// FloatIsNaN means the float is a special NaN value.
 	FloatIsNaN
-	// FloatIsPosInf means the float is a special positive inifitiy value.
+	// FloatIsPosInf means the float is a special positive infinity value.
 	FloatIsPosInf
 	// FloatIsNegInf means the float is a special negative infinity value.
 	FloatIsNegInf
@@ -497,7 +497,7 @@ func (g *G) Defer() *Defer {
 // UserCurrent returns the location the users code is at,
 // or was at before entering a runtime function.
 func (g *G) UserCurrent() Location {
-	it, err := g.stackIterator(0)
+	it, err := goroutineStackIterator(nil, g, 0)
 	if err != nil {
 		return g.CurrentLoc
 	}
@@ -535,7 +535,7 @@ func (g *G) StartLoc(tgt *Target) Location {
 	if fn == nil {
 		return Location{PC: g.StartPC}
 	}
-	f, l := fn.cu.lineInfo.PCToLine(fn.Entry, fn.Entry)
+	f, l := tgt.BinInfo().EntryLineForFunc(fn)
 	return Location{PC: fn.Entry, File: f, Line: l, Fn: fn}
 }
 
@@ -671,7 +671,7 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 		v.stride = 1
 		v.fieldType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 1, Name: "byte", ReflectKind: reflect.Uint8}, BitSize: 8, BitOffset: 0}}
 		if v.Addr != 0 {
-			v.Base, v.Len, v.Unreadable = readStringInfo(v.mem, v.bi.Arch, v.Addr)
+			v.Base, v.Len, v.Unreadable = readStringInfo(v.mem, v.bi.Arch, v.Addr, t)
 		}
 	case *godwarf.SliceType:
 		v.Kind = reflect.Slice
@@ -1198,9 +1198,9 @@ func extractVarInfoFromEntry(tgt *Target, bi *BinaryInfo, image *Image, regs op.
 	if pieces != nil {
 		var cmem *compositeMemory
 		if tgt != nil {
-			addr, cmem, err = tgt.newCompositeMemory(mem, regs, pieces, descr)
+			addr, cmem, err = tgt.newCompositeMemory(mem, regs, pieces, descr, t.Common().ByteSize)
 		} else {
-			cmem, err = newCompositeMemory(mem, bi.Arch, regs, pieces)
+			cmem, err = newCompositeMemory(mem, bi.Arch, regs, pieces, t.Common().ByteSize)
 			if cmem != nil {
 				cmem.base = fakeAddressUnresolv
 				addr = int64(cmem.base)
@@ -1305,10 +1305,21 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 			// Don't increase the recursion level when dereferencing pointers
 			// unless this is a pointer to interface (which could cause an infinite loop)
 			nextLvl := recurseLevel
+			checkLvl := false
 			if v.Children[0].Kind == reflect.Interface {
 				nextLvl++
+			} else if ptyp, isptr := v.RealType.(*godwarf.PtrType); isptr {
+				_, elemTypIsPtr := resolveTypedef(ptyp.Type).(*godwarf.PtrType)
+				if elemTypIsPtr {
+					nextLvl++
+					checkLvl = true
+				}
 			}
-			v.Children[0].loadValueInternal(nextLvl, cfg)
+			if checkLvl && recurseLevel > cfg.MaxVariableRecurse {
+				v.Children[0].OnlyAddr = true
+			} else {
+				v.Children[0].loadValueInternal(nextLvl, cfg)
+			}
 		} else {
 			v.Children[0].OnlyAddr = true
 		}
@@ -1422,7 +1433,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 	case reflect.Func:
 		v.readFunctionPtr()
 	default:
-		v.Unreadable = fmt.Errorf("unknown or unsupported kind: \"%s\"", v.Kind.String())
+		v.Unreadable = fmt.Errorf("unknown or unsupported kind: %q", v.Kind.String())
 	}
 }
 
@@ -1455,30 +1466,38 @@ func convertToEface(srcv, dstv *Variable) error {
 	return dstv.writeEmptyInterface(typeAddr, srcv)
 }
 
-func readStringInfo(mem MemoryReadWriter, arch *Arch, addr uint64) (uint64, int64, error) {
+func readStringInfo(mem MemoryReadWriter, arch *Arch, addr uint64, typ *godwarf.StringType) (uint64, int64, error) {
 	// string data structure is always two ptrs in size. Addr, followed by len
 	// http://research.swtch.com/godata
 
 	mem = cacheMemory(mem, addr, arch.PtrSize()*2)
 
-	// read len
-	strlen, err := readIntRaw(mem, addr+uint64(arch.PtrSize()), int64(arch.PtrSize()))
-	if err != nil {
-		return 0, 0, fmt.Errorf("could not read string len %s", err)
-	}
-	if strlen < 0 {
-		return 0, 0, fmt.Errorf("invalid length: %d", strlen)
+	var strlen int64
+	var outaddr uint64
+	var err error
+
+	for _, field := range typ.StructType.Field {
+		switch field.Name {
+		case "len":
+			strlen, err = readIntRaw(mem, addr+uint64(field.ByteOffset), int64(arch.PtrSize()))
+			if err != nil {
+				return 0, 0, fmt.Errorf("could not read string len %s", err)
+			}
+			if strlen < 0 {
+				return 0, 0, fmt.Errorf("invalid length: %d", strlen)
+			}
+		case "str":
+			outaddr, err = readUintRaw(mem, addr+uint64(field.ByteOffset), int64(arch.PtrSize()))
+			if err != nil {
+				return 0, 0, fmt.Errorf("could not read string pointer %s", err)
+			}
+			if addr == 0 {
+				return 0, 0, nil
+			}
+		}
 	}
 
-	// read addr
-	addr, err = readUintRaw(mem, addr, int64(arch.PtrSize()))
-	if err != nil {
-		return 0, 0, fmt.Errorf("could not read string pointer %s", err)
-	}
-	if addr == 0 {
-		return 0, 0, nil
-	}
-	return addr, strlen, nil
+	return outaddr, strlen, nil
 }
 
 func readStringValue(mem MemoryReadWriter, addr uint64, strlen int64, cfg LoadConfig) (string, error) {
@@ -1839,7 +1858,7 @@ func (v *Variable) writeZero() error {
 	return err
 }
 
-// writeInterface writes the empty interface of type typeAddr and data as the data field.
+// writeEmptyInterface writes the empty interface of type typeAddr and data as the data field.
 func (v *Variable) writeEmptyInterface(typeAddr uint64, data *Variable) error {
 	dstType, dstData, _ := v.readInterface()
 	if v.Unreadable != nil {
@@ -2248,7 +2267,7 @@ func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
 
 	// +rtype -field iface.tab *itab
 	// +rtype -field iface.data unsafe.Pointer
-	// +rtype -field eface._type *_type
+	// +rtype -field eface._type *_type|*internal/abi.Type
 	// +rtype -field eface.data unsafe.Pointer
 
 	for _, f := range ityp.Field {
@@ -2259,7 +2278,7 @@ func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
 			isnil = tab.Addr == 0
 			if !isnil {
 				var err error
-				_type, err = tab.structMember("_type") // +rtype *_type
+				_type, err = tab.structMember("_type") // +rtype *_type|*internal/abi.Type
 				if err != nil {
 					v.Unreadable = fmt.Errorf("invalid interface type: %v", err)
 					return

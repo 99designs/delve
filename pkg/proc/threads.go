@@ -2,6 +2,7 @@ package proc
 
 import (
 	"errors"
+
 	"github.com/go-delve/delve/pkg/dwarf/op"
 )
 
@@ -17,7 +18,7 @@ type Thread interface {
 	// variable returned may or may not change to reflect the new CPU status
 	// when the thread is resumed or the registers are changed by calling
 	// SetPC/SetSP/etc.
-	// To insure that the the returned variable won't change call the Copy
+	// To insure that the returned variable won't change call the Copy
 	// method of Registers.
 	Registers() (Registers, error)
 
@@ -66,14 +67,14 @@ func (t *CommonThread) ReturnValues(cfg LoadConfig) []*Variable {
 }
 
 // topframe returns the two topmost frames of g, or thread if g is nil.
-func topframe(g *G, thread Thread) (Stackframe, Stackframe, error) {
+func topframe(tgt *Target, g *G, thread Thread) (Stackframe, Stackframe, error) {
 	var frames []Stackframe
 	var err error
 
 	if g == nil {
-		frames, err = ThreadStacktrace(thread, 1)
+		frames, err = ThreadStacktrace(tgt, thread, 1)
 	} else {
-		frames, err = g.Stacktrace(1, StacktraceReadDefers)
+		frames, err = GoroutineStacktrace(tgt, g, 1, StacktraceReadDefers)
 	}
 	if err != nil {
 		return Stackframe{}, Stackframe{}, err

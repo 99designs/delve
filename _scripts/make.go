@@ -144,7 +144,7 @@ func checkCert() bool {
 		return false
 	}
 	if err != nil {
-		fmt.Printf("An error occoured when generating and installing a new certificate: %v\n", err)
+		fmt.Printf("An error occurred when generating and installing a new certificate: %v\n", err)
 		return false
 	}
 	os.Setenv("CERT", "dlv-cert")
@@ -291,6 +291,9 @@ func tagFlags() string {
 	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 		tags = append(tags, "exp.winarm64")
 	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
+		tags = append(tags, "exp.linuxppc64le")
+	}
 	if Tags != nil && len(*Tags) > 0 {
 		tags = append(tags, *Tags...)
 	}
@@ -395,7 +398,9 @@ func testStandard() {
 		dopie := false
 		switch runtime.GOOS {
 		case "linux":
-			dopie = true
+			if runtime.GOARCH != "ppc64le" {
+				dopie = true
+			}
 		case "windows":
 			// windows/arm64 always uses pie buildmode, no need to test everything again.
 			// only on Go 1.15 or later, with CGO_ENABLED and gcc found in path
@@ -409,6 +414,11 @@ func testStandard() {
 						dopie = true
 					}
 				}
+			}
+		case "darwin":
+			if runtime.GOARCH == "amd64" {
+				// arm64 can only build in pie mode
+				dopie = true
 			}
 		}
 		if dopie {

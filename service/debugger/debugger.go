@@ -104,6 +104,15 @@ type Config struct {
 	// AttachPid is the PID of an existing process to which the debugger should
 	// attach.
 	AttachPid int
+	// If AttachWaitFor is set the debugger will wait for a process with a name
+	// starting with WaitFor and attach to it.
+	AttachWaitFor string
+	// AttachWaitForInterval is the time (in milliseconds) that the debugger
+	// waits between checks for WaitFor.
+	AttachWaitForInterval float64
+	// AttachWaitForDuration is the time (in milliseconds) that the debugger
+	// waits for WaitFor.
+	AttachWaitForDuration float64
 
 	// CoreFile specifies the path to the core dump to open.
 	CoreFile string
@@ -136,8 +145,14 @@ type Config struct {
 	// ExecuteKind contains the kind of the executed program.
 	ExecuteKind ExecuteKind
 
-	// Redirects specifies redirect rules for stdin, stdout and stderr
-	Redirects [3]string
+	// Stdin Redirect file path for stdin
+	Stdin string
+
+	// Redirects specifies redirect rules for stdout
+	Stdout proc.OutputRedirect
+
+	// Redirects specifies redirect rules for stderr
+	Stderr proc.OutputRedirect
 
 	// DisableASLR disables ASLR
 	DisableASLR bool
@@ -157,14 +172,22 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 
 	// Create the process by either attaching or launching.
 	switch {
-	case d.config.AttachPid > 0:
+	case d.config.AttachPid > 0 || d.config.AttachWaitFor != "":
 		d.log.Infof("attaching to pid %d", d.config.AttachPid)
 		path := ""
 		if len(d.processArgs) > 0 {
 			path = d.processArgs[0]
 		}
+		var waitFor *proc.WaitFor
+		if d.config.AttachWaitFor != "" {
+			waitFor = &proc.WaitFor{
+				Name:     d.config.AttachWaitFor,
+				Interval: time.Duration(d.config.AttachWaitForInterval * float64(time.Millisecond)),
+				Duration: time.Duration(d.config.AttachWaitForDuration * float64(time.Millisecond)),
+			}
+		}
 		var err error
-		d.target, err = d.Attach(d.config.AttachPid, path)
+		d.target, err = d.Attach(d.config.AttachPid, path, waitFor)
 		if err != nil {
 			err = go11DecodeErrorCheck(err)
 			err = noDebugErrorWarning(err)
@@ -176,7 +199,7 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 		switch d.config.Backend {
 		case "rr":
 			d.log.Infof("opening trace %s", d.config.CoreFile)
-			d.target, err = gdbserial.Replay(d.config.CoreFile, false, false, d.config.DebugInfoDirectories, d.config.RrOnProcessPid)
+			d.target, err = gdbserial.Replay(d.config.CoreFile, false, false, d.config.DebugInfoDirectories, d.config.RrOnProcessPid, "")
 		default:
 			d.log.Infof("opening core file %s (executable %s)", d.config.CoreFile, d.processArgs[0])
 			d.target, err = core.OpenCore(d.config.CoreFile, d.processArgs[0], d.config.DebugInfoDirectories)
@@ -259,16 +282,16 @@ func (d *Debugger) Launch(processArgs []string, wd string) (*proc.TargetGroup, e
 
 	switch d.config.Backend {
 	case "native":
-		return native.Launch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, d.config.Redirects)
+		return native.Launch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, d.config.Stdin, d.config.Stdout, d.config.Stderr)
 	case "lldb":
-		return betterGdbserialLaunchError(gdbserial.LLDBLaunch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, d.config.Redirects))
+		return betterGdbserialLaunchError(gdbserial.LLDBLaunch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, [3]string{d.config.Stdin, d.config.Stdout.Path, d.config.Stderr.Path}))
 	case "rr":
 		if d.target != nil {
 			// restart should not call us if the backend is 'rr'
 			panic("internal error: call to Launch with rr backend and target already exists")
 		}
 
-		run, stop, err := gdbserial.RecordAsync(processArgs, wd, false, d.config.Redirects)
+		run, stop, err := gdbserial.RecordAsync(processArgs, wd, false, d.config.Stdin, d.config.Stdout, d.config.Stderr)
 		if err != nil {
 			return nil, err
 		}
@@ -303,9 +326,9 @@ func (d *Debugger) Launch(processArgs []string, wd string) (*proc.TargetGroup, e
 
 	case "default":
 		if runtime.GOOS == "darwin" {
-			return betterGdbserialLaunchError(gdbserial.LLDBLaunch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, d.config.Redirects))
+			return betterGdbserialLaunchError(gdbserial.LLDBLaunch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, [3]string{d.config.Stdin, d.config.Stdout.Path, d.config.Stderr.Path}))
 		}
-		return native.Launch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, d.config.Redirects)
+		return native.Launch(processArgs, wd, launchFlags, d.config.DebugInfoDirectories, d.config.TTY, d.config.Stdin, d.config.Stdout, d.config.Stderr)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", d.config.Backend)
 	}
@@ -335,21 +358,21 @@ func (d *Debugger) recordingRun(run func() (string, error)) (*proc.TargetGroup, 
 		return nil, err
 	}
 
-	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories, 0)
+	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories, 0, strings.Join(d.processArgs, " "))
 }
 
 // Attach will attach to the process specified by 'pid'.
-func (d *Debugger) Attach(pid int, path string) (*proc.TargetGroup, error) {
+func (d *Debugger) Attach(pid int, path string, waitFor *proc.WaitFor) (*proc.TargetGroup, error) {
 	switch d.config.Backend {
 	case "native":
-		return native.Attach(pid, d.config.DebugInfoDirectories)
+		return native.Attach(pid, waitFor, d.config.DebugInfoDirectories)
 	case "lldb":
-		return betterGdbserialLaunchError(gdbserial.LLDBAttach(pid, path, d.config.DebugInfoDirectories))
+		return betterGdbserialLaunchError(gdbserial.LLDBAttach(pid, path, waitFor, d.config.DebugInfoDirectories))
 	case "default":
 		if runtime.GOOS == "darwin" {
-			return betterGdbserialLaunchError(gdbserial.LLDBAttach(pid, path, d.config.DebugInfoDirectories))
+			return betterGdbserialLaunchError(gdbserial.LLDBAttach(pid, path, waitFor, d.config.DebugInfoDirectories))
 		}
-		return native.Attach(pid, d.config.DebugInfoDirectories)
+		return native.Attach(pid, waitFor, d.config.DebugInfoDirectories)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", d.config.Backend)
 	}
@@ -472,12 +495,19 @@ func (d *Debugger) Restart(rerecord bool, pos string, resetArgs bool, newArgs []
 		return nil, ErrCanNotRestart
 	}
 
+	if !resetArgs && (d.config.Stdout.File != nil || d.config.Stderr.File != nil) {
+		return nil, ErrCanNotRestart
+
+	}
+
 	if err := d.detach(true); err != nil {
 		return nil, err
 	}
 	if resetArgs {
 		d.processArgs = append([]string{d.processArgs[0]}, newArgs...)
-		d.config.Redirects = newRedirects
+		d.config.Stdin = newRedirects[0]
+		d.config.Stdout = proc.OutputRedirect{Path: newRedirects[1]}
+		d.config.Stderr = proc.OutputRedirect{Path: newRedirects[2]}
 	}
 	var grp *proc.TargetGroup
 	var err error
@@ -501,7 +531,7 @@ func (d *Debugger) Restart(rerecord bool, pos string, resetArgs bool, newArgs []
 	}
 
 	if recorded {
-		run, stop, err2 := gdbserial.RecordAsync(d.processArgs, d.config.WorkingDir, false, d.config.Redirects)
+		run, stop, err2 := gdbserial.RecordAsync(d.processArgs, d.config.WorkingDir, false, d.config.Stdin, d.config.Stdout, d.config.Stderr)
 		if err2 != nil {
 			return nil, err2
 		}
@@ -568,6 +598,7 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
 
 	state = &api.DebuggerState{
 		Pid:               tgt.Pid(),
+		TargetCommandLine: tgt.CmdLine,
 		SelectedGoroutine: goroutine,
 		Exited:            exited,
 	}
@@ -603,7 +634,7 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
 	for t.Next() {
 		for _, bp := range t.Breakpoints().WatchOutOfScope {
 			abp := api.ConvertLogicalBreakpoint(bp.Logical)
-			api.ConvertPhysicalBreakpoints(abp, []int{t.Pid()}, []*proc.Breakpoint{bp})
+			api.ConvertPhysicalBreakpoints(abp, bp.Logical, []int{t.Pid()}, []*proc.Breakpoint{bp})
 			state.WatchOutOfScope = append(state.WatchOutOfScope, abp)
 		}
 	}
@@ -723,50 +754,16 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint, locExpr string,
 			return nil, err
 		}
 		setbp.Expr = func(t *proc.Target) []uint64 {
-			locs, err := loc.Find(t, d.processArgs, nil, locExpr, false, substitutePathRules)
+			locs, _, err := loc.Find(t, d.processArgs, nil, locExpr, false, substitutePathRules)
 			if err != nil || len(locs) != 1 {
 				logflags.DebuggerLogger().Debugf("could not evaluate breakpoint expression %q: %v (number of results %d)", locExpr, err, len(locs))
 				return nil
 			}
 			return locs[0].PCs
 		}
+		setbp.ExprString = locExpr
 	}
-	createdBp, err := createLogicalBreakpoint(d, requestedBp, &setbp, suspended)
 
-	if err != nil {
-		return nil, err
-	}
-	d.log.Infof("created breakpoint: %#v", createdBp)
-	return createdBp, nil
-}
-
-func (d *Debugger) convertBreakpoint(lbp *proc.LogicalBreakpoint) *api.Breakpoint {
-	abp := api.ConvertLogicalBreakpoint(lbp)
-	bps := []*proc.Breakpoint{}
-	pids := []int{}
-	t := proc.ValidTargets{Group: d.target}
-	for t.Next() {
-		for _, bp := range t.Breakpoints().M {
-			if bp.LogicalID() == lbp.LogicalID {
-				bps = append(bps, bp)
-				pids = append(pids, t.Pid())
-			}
-		}
-	}
-	api.ConvertPhysicalBreakpoints(abp, pids, bps)
-	return abp
-}
-
-func (d *Debugger) ConvertThreadBreakpoint(thread proc.Thread) *api.Breakpoint {
-	if b := thread.Breakpoint(); b.Active && b.Breakpoint.Logical != nil {
-		return d.convertBreakpoint(b.Breakpoint.Logical)
-	}
-	return nil
-}
-
-// createLogicalBreakpoint creates one physical breakpoint for each address
-// in addrs and associates all of them with the same logical breakpoint.
-func createLogicalBreakpoint(d *Debugger, requestedBp *api.Breakpoint, setbp *proc.SetBreakpoint, suspended bool) (*api.Breakpoint, error) {
 	id := requestedBp.ID
 
 	if id <= 0 {
@@ -779,12 +776,12 @@ func createLogicalBreakpoint(d *Debugger, requestedBp *api.Breakpoint, setbp *pr
 	lbp := &proc.LogicalBreakpoint{LogicalID: id, HitCount: make(map[int64]uint64), Enabled: true}
 	d.target.LogicalBreakpoints[id] = lbp
 
-	err := copyLogicalBreakpointInfo(lbp, requestedBp)
+	err = copyLogicalBreakpointInfo(lbp, requestedBp)
 	if err != nil {
 		return nil, err
 	}
 
-	lbp.Set = *setbp
+	lbp.Set = setbp
 
 	if lbp.Set.Expr != nil {
 		addrs := lbp.Set.Expr(d.Target())
@@ -808,7 +805,33 @@ func createLogicalBreakpoint(d *Debugger, requestedBp *api.Breakpoint, setbp *pr
 		}
 	}
 
-	return d.convertBreakpoint(lbp), nil
+	createdBp := d.convertBreakpoint(lbp)
+	d.log.Infof("created breakpoint: %#v", createdBp)
+	return createdBp, nil
+}
+
+func (d *Debugger) convertBreakpoint(lbp *proc.LogicalBreakpoint) *api.Breakpoint {
+	abp := api.ConvertLogicalBreakpoint(lbp)
+	bps := []*proc.Breakpoint{}
+	pids := []int{}
+	t := proc.ValidTargets{Group: d.target}
+	for t.Next() {
+		for _, bp := range t.Breakpoints().M {
+			if bp.LogicalID() == lbp.LogicalID {
+				bps = append(bps, bp)
+				pids = append(pids, t.Pid())
+			}
+		}
+	}
+	api.ConvertPhysicalBreakpoints(abp, lbp, pids, bps)
+	return abp
+}
+
+func (d *Debugger) ConvertThreadBreakpoint(thread proc.Thread) *api.Breakpoint {
+	if b := thread.Breakpoint(); b.Active && b.Breakpoint.Logical != nil {
+		return d.convertBreakpoint(b.Breakpoint.Logical)
+	}
+	return nil
 }
 
 func (d *Debugger) CreateEBPFTracepoint(fnName string) error {
@@ -969,11 +992,6 @@ func parseHitCondition(hitCond string) (token.Token, int, error) {
 func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
-	return d.clearBreakpoint(requestedBp)
-}
-
-// clearBreakpoint clears a breakpoint, we can consume this function to avoid locking a goroutine
-func (d *Debugger) clearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint, error) {
 	if requestedBp.ID <= 0 {
 		if len(d.target.Targets()) != 1 {
 			return nil, ErrNotImplementedWithMultitarget
@@ -1039,7 +1057,7 @@ func (d *Debugger) Breakpoints(all bool) []*api.Breakpoint {
 				} else {
 					abp = &api.Breakpoint{}
 				}
-				api.ConvertPhysicalBreakpoints(abp, []int{t.Pid()}, []*proc.Breakpoint{bp})
+				api.ConvertPhysicalBreakpoints(abp, bp.Logical, []int{t.Pid()}, []*proc.Breakpoint{bp})
 				abp.VerboseDescr = bp.VerboseDescr()
 				abps = append(abps, abp)
 			}
@@ -1264,6 +1282,13 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 		err = d.target.StepOut()
 	case api.SwitchThread:
 		d.log.Debugf("switching to thread %d", command.ThreadID)
+		t := proc.ValidTargets{Group: d.target}
+		for t.Next() {
+			if _, ok := t.FindThread(command.ThreadID); ok {
+				d.target.Selected = t.Target
+				break
+			}
+		}
 		err = d.target.Selected.SwitchThread(command.ThreadID)
 		withBreakpointInfo = false
 	case api.SwitchGoroutine:
@@ -1321,6 +1346,13 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
 
 	tgt := d.target.TargetForThread(thread.ThreadID())
 
+	// If we're dealing with a stripped binary don't attempt to load more
+	// information, we won't be able to.
+	img := tgt.BinInfo().PCToImage(bp.Addr)
+	if img != nil && img.Stripped() {
+		return nil
+	}
+
 	if bp.Goroutine {
 		g, err := proc.GetG(thread)
 		if err != nil {
@@ -1330,7 +1362,7 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
 	}
 
 	if bp.Stacktrace > 0 {
-		rawlocs, err := proc.ThreadStacktrace(thread, bp.Stacktrace)
+		rawlocs, err := proc.ThreadStacktrace(tgt, thread, bp.Stacktrace)
 		if err != nil {
 			return err
 		}
@@ -1388,7 +1420,7 @@ func (d *Debugger) Sources(filter string) ([]string, error) {
 	t := proc.ValidTargets{Group: d.target}
 	for t.Next() {
 		for _, f := range t.BinInfo().Sources {
-			if regex.Match([]byte(f)) {
+			if regex.MatchString(f) {
 				files = append(files, f)
 			}
 		}
@@ -1399,7 +1431,7 @@ func (d *Debugger) Sources(filter string) ([]string, error) {
 }
 
 func uniq(s []string) []string {
-	if len(s) <= 0 {
+	if len(s) == 0 {
 		return s
 	}
 	src, dst := 1, 1
@@ -1457,7 +1489,7 @@ func (d *Debugger) Types(filter string) ([]string, error) {
 		}
 
 		for _, typ := range types {
-			if regex.Match([]byte(typ)) {
+			if regex.MatchString(typ) {
 				r = append(r, typ)
 			}
 		}
@@ -1490,7 +1522,7 @@ func (d *Debugger) PackageVariables(filter string, cfg proc.LoadConfig) ([]*proc
 	}
 	pvr := pv[:0]
 	for i := range pv {
-		if regex.Match([]byte(pv[i].Name)) {
+		if regex.MatchString(pv[i].Name) {
 			pvr = append(pvr, pv[i])
 		}
 	}
@@ -1656,6 +1688,8 @@ func matchGoroutineFilter(tgt *proc.Target, g *proc.G, filter *api.ListGoroutine
 		val = g.Thread != nil
 	case api.GoroutineUser:
 		val = !g.System(tgt)
+	case api.GoroutineWaitingOnChannel:
+		val = true // handled elsewhere
 	}
 	if filter.Negated {
 		val = !val
@@ -1675,9 +1709,16 @@ func formatLoc(loc proc.Location) string {
 	return fmt.Sprintf("%s:%d in %s", loc.File, loc.Line, fnname)
 }
 
-// GroupGoroutines divides goroutines in gs into groups as specified by groupBy and groupByArg.
-// A maximum of maxGoroutinesPerGroup are saved in each group, but the total
-// number of goroutines in each group is recorded.
+// GroupGoroutines divides goroutines in gs into groups as specified by
+// group.{GroupBy,GroupByKey}. A maximum of group.MaxGroupMembers are saved in
+// each group, but the total number of goroutines in each group is recorded. If
+// group.MaxGroups is set, then at most that many groups are returned. If some
+// groups end up being dropped because of this limit, the tooManyGroups return
+// value is set.
+//
+// The first return value represents the goroutines that have been included in
+// one of the returned groups (subject to the MaxGroupMembers and MaxGroups
+// limits). The second return value represents the groups.
 func (d *Debugger) GroupGoroutines(gs []*proc.G, group *api.GoroutineGroupingOptions) ([]*proc.G, []api.GoroutineGroup, bool) {
 	if group.GroupBy == api.GoroutineFieldNone {
 		return gs, nil, false
@@ -1749,9 +1790,9 @@ func (d *Debugger) Stacktrace(goroutineID int64, depth int, opts api.StacktraceO
 	}
 
 	if g == nil {
-		return proc.ThreadStacktrace(d.target.Selected.CurrentThread(), depth)
+		return proc.ThreadStacktrace(d.target.Selected, d.target.Selected.CurrentThread(), depth)
 	} else {
-		return g.Stacktrace(depth, proc.StacktraceOptions(opts))
+		return proc.GoroutineStacktrace(d.target.Selected, g, depth, proc.StacktraceOptions(opts))
 	}
 }
 
@@ -1824,7 +1865,7 @@ func (d *Debugger) convertStacktrace(rawlocs []proc.Stackframe, cfg *proc.LoadCo
 		}
 		if cfg != nil && rawlocs[i].Current.Fn != nil {
 			var err error
-			scope := proc.FrameToScope(d.target.Selected, d.target.Selected.Memory(), nil, rawlocs[i:]...)
+			scope := proc.FrameToScope(d.target.Selected, d.target.Selected.Memory(), nil, 0, rawlocs[i:]...)
 			locals, err := scope.LocalVariables(*cfg)
 			if err != nil {
 				return nil, err
@@ -1849,25 +1890,30 @@ func (d *Debugger) convertDefers(defers []*proc.Defer) []api.Defer {
 		ddf, ddl, ddfn := defers[i].DeferredFunc(d.target.Selected)
 		drf, drl, drfn := d.target.Selected.BinInfo().PCToLine(defers[i].DeferPC)
 
-		r[i] = api.Defer{
-			DeferredLoc: api.ConvertLocation(proc.Location{
-				PC:   ddfn.Entry,
-				File: ddf,
-				Line: ddl,
-				Fn:   ddfn,
-			}),
-			DeferLoc: api.ConvertLocation(proc.Location{
-				PC:   defers[i].DeferPC,
-				File: drf,
-				Line: drl,
-				Fn:   drfn,
-			}),
-			SP: defers[i].SP,
-		}
-
 		if defers[i].Unreadable != nil {
 			r[i].Unreadable = defers[i].Unreadable.Error()
+		} else {
+			var entry uint64 = defers[i].DeferPC
+			if ddfn != nil {
+				entry = ddfn.Entry
+			}
+			r[i] = api.Defer{
+				DeferredLoc: api.ConvertLocation(proc.Location{
+					PC:   entry,
+					File: ddf,
+					Line: ddl,
+					Fn:   ddfn,
+				}),
+				DeferLoc: api.ConvertLocation(proc.Location{
+					PC:   defers[i].DeferPC,
+					File: drf,
+					Line: drl,
+					Fn:   drfn,
+				}),
+				SP: defers[i].SP,
+			}
 		}
+
 	}
 
 	return r
@@ -1894,17 +1940,17 @@ func (d *Debugger) CurrentPackage() (string, error) {
 }
 
 // FindLocation will find the location specified by 'locStr'.
-func (d *Debugger) FindLocation(goid int64, frame, deferredCall int, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, error) {
+func (d *Debugger) FindLocation(goid int64, frame, deferredCall int, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, string, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
 	if _, err := d.target.Valid(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	loc, err := locspec.Parse(locStr)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	return d.findLocation(goid, frame, deferredCall, locStr, loc, includeNonExecutableLines, substitutePathRules)
@@ -1922,18 +1968,23 @@ func (d *Debugger) FindLocationSpec(goid int64, frame, deferredCall int, locStr 
 		return nil, err
 	}
 
-	return d.findLocation(goid, frame, deferredCall, locStr, locSpec, includeNonExecutableLines, substitutePathRules)
+	locs, _, err := d.findLocation(goid, frame, deferredCall, locStr, locSpec, includeNonExecutableLines, substitutePathRules)
+	return locs, err
 }
 
-func (d *Debugger) findLocation(goid int64, frame, deferredCall int, locStr string, locSpec locspec.LocationSpec, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, error) {
+func (d *Debugger) findLocation(goid int64, frame, deferredCall int, locStr string, locSpec locspec.LocationSpec, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, string, error) {
 	locations := []api.Location{}
 	t := proc.ValidTargets{Group: d.target}
+	subst := ""
 	for t.Next() {
 		pid := t.Pid()
 		s, _ := proc.ConvertEvalScope(t.Target, goid, frame, deferredCall)
-		locs, err := locSpec.Find(t.Target, d.processArgs, s, locStr, includeNonExecutableLines, substitutePathRules)
+		locs, s1, err := locSpec.Find(t.Target, d.processArgs, s, locStr, includeNonExecutableLines, substitutePathRules)
+		if s1 != "" {
+			subst = s1
+		}
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		for i := range locs {
 			if locs[i].PC == 0 {
@@ -1950,7 +2001,7 @@ func (d *Debugger) findLocation(goid int64, frame, deferredCall int, locStr stri
 		}
 		locations = append(locations, locs...)
 	}
-	return locations, nil
+	return locations, subst, nil
 }
 
 // Disassemble code between startPC and endPC.
@@ -2197,7 +2248,7 @@ func (d *Debugger) DumpWait(wait time.Duration) *proc.DumpState {
 	return &d.dumpState
 }
 
-// DumpCancel canels a dump in progress
+// DumpCancel cancels a dump in progress
 func (d *Debugger) DumpCancel() error {
 	d.dumpState.Mutex.Lock()
 	d.dumpState.Canceled = true
@@ -2245,6 +2296,60 @@ func (d *Debugger) GetBufferedTracepoints() []api.TracepointResult {
 		}
 	}
 	return results
+}
+
+// FollowExec enabled or disables follow exec mode.
+func (d *Debugger) FollowExec(enabled bool, regex string) error {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	return d.target.FollowExec(enabled, regex)
+}
+
+// FollowExecEnabled returns true if follow exec mode is enabled.
+func (d *Debugger) FollowExecEnabled() bool {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	return d.target.FollowExecEnabled()
+}
+
+func (d *Debugger) SetDebugInfoDirectories(v []string) {
+	d.recordMutex.Lock()
+	defer d.recordMutex.Unlock()
+	it := proc.ValidTargets{Group: d.target}
+	for it.Next() {
+		it.BinInfo().DebugInfoDirectories = v
+	}
+}
+
+func (d *Debugger) DebugInfoDirectories() []string {
+	d.recordMutex.Lock()
+	defer d.recordMutex.Unlock()
+	return d.target.Selected.BinInfo().DebugInfoDirectories
+}
+
+// ChanGoroutines returns the list of goroutines waiting on the channel specified by expr.
+func (d *Debugger) ChanGoroutines(goid int64, frame, deferredCall int, expr string, start, count int) ([]*proc.G, error) {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	s, err := proc.ConvertEvalScope(d.target.Selected, goid, frame, deferredCall)
+	if err != nil {
+		return nil, err
+	}
+
+	goids, err := s.ChanGoroutines(expr, start, count)
+	if err != nil {
+		return nil, err
+	}
+
+	gs := make([]*proc.G, len(goids))
+	for i := range goids {
+		g, err := proc.FindGoroutine(d.target.Selected, goids[i])
+		if g == nil {
+			g = &proc.G{Unreadable: err}
+		}
+		gs[i] = g
+	}
+	return gs, nil
 }
 
 func go11DecodeErrorCheck(err error) error {

@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
-	"strings"
 
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/op"
@@ -60,7 +59,7 @@ func ARM64Arch(goos string) *Arch {
 func arm64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *BinaryInfo) *frame.FrameContext {
 	a := bi.Arch
 	if a.sigreturnfn == nil {
-		a.sigreturnfn = bi.LookupFunc["runtime.sigreturn"]
+		a.sigreturnfn = bi.lookupOneFunc("runtime.sigreturn")
 	}
 
 	if fctxt == nil || (a.sigreturnfn != nil && pc >= a.sigreturnfn.Entry && pc < a.sigreturnfn.End) {
@@ -107,7 +106,7 @@ func arm64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *Binary
 	}
 
 	if a.crosscall2fn == nil {
-		a.crosscall2fn = bi.LookupFunc["crosscall2"]
+		a.crosscall2fn = bi.lookupOneFunc("crosscall2")
 	}
 
 	if a.crosscall2fn != nil && pc >= a.crosscall2fn.Entry && pc < a.crosscall2fn.End {
@@ -211,17 +210,26 @@ func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool 
 			it.top = false
 			it.systemstack = false
 			// The return value is stored in the LR register which is saved at 24(SP).
-			it.frame.addrret = uint64(int64(it.regs.SP()) + int64(it.bi.Arch.PtrSize()*3))
-			it.frame.Ret, _ = readUintRaw(it.mem, it.frame.addrret, int64(it.bi.Arch.PtrSize()))
+			addrret := uint64(int64(it.regs.SP()) + int64(it.bi.Arch.PtrSize()*3))
+			it.frame.Ret, _ = readUintRaw(it.mem, addrret, int64(it.bi.Arch.PtrSize()))
 			it.pc = it.frame.Ret
 
 			return true
 		}
 
-	case "runtime.goexit", "runtime.rt0_go", "runtime.mcall":
+	case "runtime.goexit", "runtime.rt0_go":
 		// Look for "top of stack" functions.
 		it.atend = true
 		return true
+
+	case "runtime.mcall":
+		if it.systemstack && it.g != nil {
+			it.switchToGoroutineStack()
+			return true
+		}
+		it.atend = true
+		return true
+
 	case "crosscall2":
 		// The offsets get from runtime/cgo/asm_arm64.s:10
 		bpoff := uint64(14)
@@ -269,15 +277,9 @@ func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool 
 			it.switchToGoroutineStack()
 			return true
 		}
-	default:
-		if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.throw" && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
-			// The runtime switches to the system stack in multiple places.
-			// This usually happens through a call to runtime.systemstack but there
-			// are functions that switch to the system stack manually (for example
-			// runtime.morestack).
-			// Since we are only interested in printing the system stack for cgo
-			// calls we switch directly to the goroutine stack if we detect that the
-			// function at the top of the stack is a runtime function.
+
+	case "runtime.newstack", "runtime.systemstack":
+		if it.systemstack && it.g != nil {
 			it.switchToGoroutineStack()
 			return true
 		}

@@ -71,7 +71,7 @@ import (
 // a dummy/error response to avoid blocking.
 //
 // This is the only goroutine that sends a stop-server signal
-// via config.DisconnecChan when encountering a client connection
+// via config.DisconnectChan when encountering a client connection
 // error or responding to a (synchronous) DAP disconnect request.
 // Once stop is triggered, the goroutine exits.
 //
@@ -124,7 +124,7 @@ type Session struct {
 	// exceptionErr tracks the runtime error that last occurred.
 	exceptionErr error
 	// clientCapabilities tracks special settings for handling debug session requests.
-	clientCapabilities dapClientCapabilites
+	clientCapabilities dapClientCapabilities
 
 	// mu synchronizes access to objects set on start-up (from run goroutine)
 	// and stopped on teardown (from main goroutine)
@@ -157,6 +157,15 @@ type Session struct {
 	// changeStateMu must be held for a request to protect itself from another goroutine
 	// changing the state of the running process at the same time.
 	changeStateMu sync.Mutex
+
+	// stdoutReader the programs's stdout.
+	stdoutReader io.ReadCloser
+
+	// stderrReader the program's stderr.
+	stderrReader io.ReadCloser
+
+	// preTerminatedWG the WaitGroup that needs to wait before sending a terminated event.
+	preTerminatedWG sync.WaitGroup
 }
 
 // Config is all the information needed to start the debugger, handle
@@ -203,7 +212,7 @@ type process struct {
 // impact handling of subsequent requests.
 // The fields with cfgName tag can be updated through an evaluation request.
 type launchAttachArgs struct {
-	// stopOnEntry is set to automatically stop the debugee after start.
+	// stopOnEntry is set to automatically stop the debuggee after start.
 	stopOnEntry bool
 	// StackTraceDepth is the maximum length of the returned list of stack frames.
 	StackTraceDepth int `cfgName:"stackTraceDepth"`
@@ -236,9 +245,9 @@ var defaultArgs = launchAttachArgs{
 	substitutePathServerToClient: [][2]string{},
 }
 
-// dapClientCapabilites captures arguments from intitialize request that
+// dapClientCapabilities captures arguments from initialize request that
 // impact handling of subsequent requests.
-type dapClientCapabilites struct {
+type dapClientCapabilities struct {
 	supportsVariableType         bool
 	supportsVariablePaging       bool
 	supportsRunInTerminalRequest bool
@@ -320,7 +329,8 @@ func NewSession(conn io.ReadWriteCloser, config *Config, debugger *debugger.Debu
 	}
 	config.log.Debugf("DAP connection %d started", sessionCount)
 	if config.StopTriggered == nil {
-		config.log.Fatal("Session must be configured with StopTriggered")
+		config.log.Error("Session must be configured with StopTriggered")
+		os.Exit(1)
 	}
 	return &Session{
 		config:            config,
@@ -336,7 +346,7 @@ func NewSession(conn io.ReadWriteCloser, config *Config, debugger *debugger.Debu
 
 // If user-specified options are provided via Launch/AttachRequest,
 // we override the defaults for optional args.
-func (s *Session) setLaunchAttachArgs(args LaunchAttachCommonConfig) error {
+func (s *Session) setLaunchAttachArgs(args LaunchAttachCommonConfig) {
 	s.args.stopOnEntry = args.StopOnEntry
 	if depth := args.StackTraceDepth; depth > 0 {
 		s.args.StackTraceDepth = depth
@@ -355,14 +365,13 @@ func (s *Session) setLaunchAttachArgs(args LaunchAttachCommonConfig) error {
 		s.args.substitutePathClientToServer = clientToServer
 		s.args.substitutePathServerToClient = serverToClient
 	}
-	return nil
 }
 
 // Stop stops the DAP debugger service, closes the listener and the client
 // connection. It shuts down the underlying debugger and kills the target
 // process if it was launched by it or stops the noDebug process.
 // This method mustn't be called more than once.
-// StopTriggered notifies other goroutines that stop is in progreess.
+// StopTriggered notifies other goroutines that stop is in progress.
 func (s *Server) Stop() {
 	s.config.log.Debug("DAP server stopping...")
 	defer s.config.log.Debug("DAP server stopped")
@@ -404,7 +413,7 @@ func (s *Session) Close() {
 	// Unless Stop() was called after read loop in ServeDAPCodec()
 	// returned, this will result in a closed connection error
 	// on next read, breaking out the read loop and
-	// allowing the run goroutinee to exit.
+	// allowing the run goroutines to exit.
 	// This connection is closed here and in serveDAPCodec().
 	// If this was a forced shutdown, external stop logic can close this first.
 	// If this was a client loop exit (on error or disconnect), serveDAPCodec()
@@ -417,13 +426,13 @@ func (s *Session) Close() {
 // signals that client sent a disconnect request or there was connection
 // failure or closure. Since the server currently services only one
 // client, this is used as a signal to stop the entire server.
-// The function safeguards agaist closing the channel more
+// The function safeguards against closing the channel more
 // than once and can be called multiple times. It is not thread-safe
 // and is currently only called from the run goroutine.
 func (c *Config) triggerServerStop() {
 	// Avoid accidentally closing the channel twice and causing a panic, when
 	// this function is called more than once because stop was triggered
-	// by multiple conditions simultenously.
+	// by multiple conditions simultaneously.
 	if c.DisconnectChan != nil {
 		close(c.DisconnectChan)
 		c.DisconnectChan = nil
@@ -445,8 +454,8 @@ func (c *Config) triggerServerStop() {
 // we need to take that into consideration.
 func (s *Server) Run() {
 	if s.listener == nil {
-		s.config.log.Fatal("Misconfigured server: no Listener is configured.")
-		return
+		s.config.log.Error("Misconfigured server: no Listener is configured.")
+		os.Exit(1)
 	}
 
 	go func() {
@@ -484,8 +493,8 @@ func (s *Server) runSession(conn io.ReadWriteCloser) {
 // until a launch/attach request is received over the connection.
 func (s *Server) RunWithClient(conn net.Conn) {
 	if s.listener != nil {
-		s.config.log.Fatal("RunWithClient must not be used when the Server is configured with a Listener")
-		return
+		s.config.log.Error("RunWithClient must not be used when the Server is configured with a Listener")
+		os.Exit(1)
 	}
 	s.config.log.Debugf("Connected to the client at %s", conn.RemoteAddr())
 	go s.runSession(conn)
@@ -505,7 +514,7 @@ func (s *Session) address() string {
 // until it encounters an error or EOF, when it sends
 // a disconnect signal and returns.
 func (s *Session) ServeDAPCodec() {
-	// Close conn, but not the debugger in case we are in AcceptMuli mode.
+	// Close conn, but not the debugger in case we are in AcceptMulti mode.
 	// If not, debugger will be shut down in Stop().
 	defer s.conn.Close()
 	reader := bufio.NewReader(s.conn)
@@ -517,7 +526,7 @@ func (s *Session) ServeDAPCodec() {
 		// potentially got some new DAP request that we do not yet have
 		// decoding support for, so we can respond with an ErrorResponse.
 		//
-		// Other errors, such as unmarshalling errors, will log the error and cause the server to trigger
+		// Other errors, such as unmarshaling errors, will log the error and cause the server to trigger
 		// a stop.
 		if err != nil {
 			s.config.log.Debug("DAP error: ", err)
@@ -580,7 +589,7 @@ func (s *Session) handleRequest(request dap.Message) {
 		return
 	}
 
-	// These requests, can be handled regardless of whether the targret is running
+	// These requests, can be handled regardless of whether the target is running
 	switch request := request.(type) {
 	case *dap.InitializeRequest: // Required
 		s.onInitializeRequest(request)
@@ -860,10 +869,6 @@ func (s *Session) setClientCapabilities(args dap.InitializeRequestArguments) {
 	s.clientCapabilities.supportsVariableType = args.SupportsVariableType
 }
 
-// Default output file pathname for the compiled binary in debug or test modes.
-// This is relative to the current working directory of the server.
-const defaultDebugBinary string = "./__debug_bin"
-
 func cleanExeName(name string) string {
 	if runtime.GOOS == "windows" && filepath.Ext(name) != ".exe" {
 		return name + ".exe"
@@ -958,8 +963,10 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 	// Prepare the debug executable filename, building it if necessary
 	debugbinary := args.Program
 	if args.Mode == "debug" || args.Mode == "test" {
+		deleteOnError := false
 		if args.Output == "" {
-			args.Output = cleanExeName(defaultDebugBinary)
+			deleteOnError = true
+			args.Output = gobuild.DefaultDebugBinaryPath("__debug_bin")
 		} else {
 			args.Output = cleanExeName(args.Output)
 		}
@@ -972,7 +979,7 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 
 		var cmd string
 		var out []byte
-		var err error
+
 		switch args.Mode {
 		case "debug":
 			cmd, out, err = gobuild.GoBuildCombinedOutput(args.Output, []string{args.Program}, args.BuildFlags)
@@ -982,6 +989,9 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 		args.DlvCwd, _ = filepath.Abs(args.DlvCwd)
 		s.config.log.Debugf("building from %q: [%s]", args.DlvCwd, cmd)
 		if err != nil {
+			if deleteOnError {
+				gobuild.Remove(args.Output)
+			}
 			s.send(&dap.OutputEvent{
 				Event: *newEvent("output"),
 				Body: dap.OutputEventBody{
@@ -1000,10 +1010,7 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 	}
 	s.config.ProcessArgs = append([]string{debugbinary}, args.Args...)
 
-	if err := s.setLaunchAttachArgs(args.LaunchAttachCommonConfig); err != nil {
-		s.sendShowUserErrorResponse(request.Request, FailedToLaunch, "Failed to launch", err.Error())
-		return
-	}
+	s.setLaunchAttachArgs(args.LaunchAttachCommonConfig)
 
 	if args.Cwd == "" {
 		if args.Mode == "test" {
@@ -1023,9 +1030,51 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 	argsToLog.Cwd, _ = filepath.Abs(args.Cwd)
 	s.config.log.Debugf("launching binary '%s' with config: %s", debugbinary, prettyPrint(argsToLog))
 
+	var redirected = false
+	switch args.OutputMode {
+	case "remote":
+		redirected = true
+	case "local", "":
+		// noting
+	default:
+		s.sendShowUserErrorResponse(request.Request, FailedToLaunch, "Failed to launch",
+			fmt.Sprintf("invalid debug configuration - unsupported 'outputMode' attribute %q", args.OutputMode))
+		return
+	}
+
+	redirectedFunc := func(stdoutReader io.ReadCloser, stderrReader io.ReadCloser) {
+		runReadFunc := func(reader io.ReadCloser, category string) {
+			defer s.preTerminatedWG.Done()
+			defer reader.Close()
+			// Read output from `reader` and send to client
+			var out [1024]byte
+			for {
+				n, err := reader.Read(out[:])
+				if err != nil {
+					if err == io.EOF {
+						return
+					}
+					s.config.log.Errorf("failed read by %s - %v ", category, err)
+					return
+				}
+				outs := string(out[:n])
+				s.send(&dap.OutputEvent{
+					Event: *newEvent("output"),
+					Body: dap.OutputEventBody{
+						Output:   outs,
+						Category: category,
+					}})
+			}
+		}
+
+		s.preTerminatedWG.Add(2)
+		go runReadFunc(stdoutReader, "stdout")
+		go runReadFunc(stderrReader, "stderr")
+	}
+
 	if args.NoDebug {
 		s.mu.Lock()
-		cmd, err := s.newNoDebugProcess(debugbinary, args.Args, s.config.Debugger.WorkingDir)
+		cmd, err := s.newNoDebugProcess(debugbinary, args.Args, s.config.Debugger.WorkingDir, redirected)
 		s.mu.Unlock()
 		if err != nil {
 			s.sendShowUserErrorResponse(request.Request, FailedToLaunch, "Failed to launch", err.Error())
@@ -1037,14 +1086,48 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 
 		// Start the program on a different goroutine, so we can listen for disconnect request.
 		go func() {
+			if redirected {
+				redirectedFunc(s.stdoutReader, s.stderrReader)
+			}
+
 			if err := cmd.Wait(); err != nil {
 				s.config.log.Debugf("program exited with error: %v", err)
 			}
+
 			close(s.noDebugProcess.exited)
 			s.logToConsole(proc.ErrProcessExited{Pid: cmd.ProcessState.Pid(), Status: cmd.ProcessState.ExitCode()}.Error())
 			s.send(&dap.TerminatedEvent{Event: *newEvent("terminated")})
 		}()
 		return
+	}
+
+	var clear func()
+	if redirected {
+		var (
+			readers         [2]io.ReadCloser
+			outputRedirects [2]proc.OutputRedirect
+		)
+
+		for i := 0; i < 2; i++ {
+			readers[i], outputRedirects[i], err = proc.Redirector()
+			if err != nil {
+				s.sendShowUserErrorResponse(request.Request, InternalError, "Internal Error",
+					fmt.Sprintf("failed to generate stdio pipes - %v", err))
+				return
+			}
+		}
+
+		s.config.Debugger.Stdout = outputRedirects[0]
+		s.config.Debugger.Stderr = outputRedirects[1]
+
+		redirectedFunc(readers[0], readers[1])
+		clear = func() {
+			for index := range readers {
+				if closeErr := readers[index].Close(); closeErr != nil {
+					s.config.log.Warnf("failed to clear redirects - %v", closeErr)
+				}
+			}
+		}
 	}
 
 	func() {
@@ -1053,7 +1136,13 @@ func (s *Session) onLaunchRequest(request *dap.LaunchRequest) {
 		s.debugger, err = debugger.New(&s.config.Debugger, s.config.ProcessArgs)
 	}()
 	if err != nil {
+		if s.binaryToRemove != "" {
+			gobuild.Remove(s.binaryToRemove)
+		}
 		s.sendShowUserErrorResponse(request.Request, FailedToLaunch, "Failed to launch", err.Error())
+		if redirected {
+			clear()
+		}
 		return
 	}
 	// Enable StepBack controls on supported backends
@@ -1072,7 +1161,7 @@ func (s *Session) getPackageDir(pkg string) string {
 	cmd := exec.Command("go", "list", "-f", "{{.Dir}}", pkg)
 	out, err := cmd.Output()
 	if err != nil {
-		s.config.log.Debugf("failed to determin package directory for %v: %v\n%s", pkg, err, out)
+		s.config.log.Debugf("failed to determine package directory for %v: %v\n%s", pkg, err, out)
 		return "."
 	}
 	return string(bytes.TrimSpace(out))
@@ -1080,15 +1169,30 @@ func (s *Session) getPackageDir(pkg string) string {
 
 // newNoDebugProcess is called from onLaunchRequest (run goroutine) and
 // requires holding mu lock. It prepares process exec.Cmd to be started.
-func (s *Session) newNoDebugProcess(program string, targetArgs []string, wd string) (*exec.Cmd, error) {
+func (s *Session) newNoDebugProcess(program string, targetArgs []string, wd string, redirected bool) (cmd *exec.Cmd, err error) {
 	if s.noDebugProcess != nil {
 		return nil, fmt.Errorf("another launch request is in progress")
 	}
-	cmd := exec.Command(program, targetArgs...)
-	cmd.Stdout, cmd.Stderr, cmd.Stdin, cmd.Dir = os.Stdout, os.Stderr, os.Stdin, wd
-	if err := cmd.Start(); err != nil {
+
+	cmd = exec.Command(program, targetArgs...)
+	cmd.Stdin, cmd.Dir = os.Stdin, wd
+
+	if redirected {
+		if s.stderrReader, err = cmd.StderrPipe(); err != nil {
+			return nil, err
+		}
+
+		if s.stdoutReader, err = cmd.StdoutPipe(); err != nil {
+			return nil, err
+		}
+	} else {
+		cmd.Stdout, cmd.Stderr = os.Stdin, os.Stderr
+	}
+
+	if err = cmd.Start(); err != nil {
 		return nil, err
 	}
+
 	s.noDebugProcess = &process{Cmd: cmd, exited: make(chan struct{})}
 	return cmd, nil
 }
@@ -1128,16 +1232,18 @@ func (s *Session) onDisconnectRequest(request *dap.DisconnectRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.debugger != nil && s.config.AcceptMulti && !request.Arguments.TerminateDebuggee {
+	if s.debugger != nil && s.config.AcceptMulti && (request.Arguments == nil || !request.Arguments.TerminateDebuggee) {
 		// This is a multi-use server/debugger, so a disconnect request that doesn't
 		// terminate the debuggee should clean up only the client connection and pointer to debugger,
 		// but not the entire server.
 		status := "halted"
 		if s.isRunningCmd() {
 			status = "running"
-		} else if s, err := s.debugger.State(false); processExited(s, err) {
+		} else if state, err := s.debugger.State(false); processExited(state, err) {
 			status = "exited"
+			s.preTerminatedWG.Wait()
 		}
+
 		s.logToConsole(fmt.Sprintf("Closing client session, but leaving multi-client DAP server at %s with debuggee %s", s.config.Listener.Addr().String(), status))
 		s.send(&dap.DisconnectResponse{Response: *newResponse(request.Request)})
 		s.send(&dap.TerminatedEvent{Event: *newEvent("terminated")})
@@ -1161,7 +1267,7 @@ func (s *Session) onDisconnectRequest(request *dap.DisconnectRequest) {
 		// In case of attach, we leave the program
 		// running by default, which can be
 		// overridden by an explicit request to terminate.
-		killProcess := s.debugger.AttachPid() == 0 || request.Arguments.TerminateDebuggee
+		killProcess := s.debugger.AttachPid() == 0 || (request.Arguments != nil && request.Arguments.TerminateDebuggee)
 		err = s.stopDebugSession(killProcess)
 	} else if s.noDebugProcess != nil {
 		s.stopNoDebugProcess()
@@ -1171,6 +1277,7 @@ func (s *Session) onDisconnectRequest(request *dap.DisconnectRequest) {
 	} else {
 		s.send(&dap.DisconnectResponse{Response: *newResponse(request.Request)})
 	}
+	s.preTerminatedWG.Wait()
 	// The debugging session has ended, so we send a terminated event.
 	s.send(&dap.TerminatedEvent{Event: *newEvent("terminated")})
 }
@@ -1428,7 +1535,7 @@ func (s *Session) onSetFunctionBreakpointsRequest(request *dap.SetFunctionBreakp
 		}
 	}, func(i int) (*bpLocation, error) {
 		want := request.Arguments.Breakpoints[i]
-		// Set the function breakpoint breakpoint
+		// Set the function breakpoint
 		spec, err := locspec.Parse(want.Name)
 		if err != nil {
 			return nil, err
@@ -1782,10 +1889,7 @@ func (s *Session) onAttachRequest(request *dap.AttachRequest) {
 		return
 	}
 
-	if err := s.setLaunchAttachArgs(args.LaunchAttachCommonConfig); err != nil {
-		s.sendShowUserErrorResponse(request.Request, FailedToAttach, "Failed to attach", err.Error())
-		return
-	}
+	s.setLaunchAttachArgs(args.LaunchAttachCommonConfig)
 
 	// Notify the client that the debugger is ready to start accepting
 	// configuration requests for setting breakpoints, etc. The client
@@ -1858,14 +1962,14 @@ func (s *Session) stoppedOnBreakpointGoroutineID(state *api.DebuggerState) (int6
 		return goid, nil
 	}
 	abp := api.ConvertLogicalBreakpoint(bp.Breakpoint.Logical)
-	api.ConvertPhysicalBreakpoints(abp, []int{0}, []*proc.Breakpoint{bp.Breakpoint})
+	api.ConvertPhysicalBreakpoints(abp, bp.Breakpoint.Logical, []int{0}, []*proc.Breakpoint{bp.Breakpoint})
 	return goid, abp
 }
 
 // stepUntilStopAndNotify is a wrapper around runUntilStopAndNotify that
 // first switches selected goroutine. allowNextStateChange is
 // a channel that will be closed to signal that an
-// asynchornous command has completed setup or was interrupted
+// asynchronous command has completed setup or was interrupted
 // due to an error, so the server is ready to receive new requests.
 func (s *Session) stepUntilStopAndNotify(command string, threadId int, granularity dap.SteppingGranularity, allowNextStateChange chan struct{}) {
 	defer closeIfOpen(allowNextStateChange)
@@ -1969,7 +2073,7 @@ func (s *Session) onStackTraceRequest(request *dap.StackTraceRequest) {
 		stackFrame := dap.StackFrame{Id: uniqueStackFrameID, Line: loc.Line, Name: fnName(loc), InstructionPointerReference: fmt.Sprintf("%#x", loc.PC)}
 		if loc.File != "<autogenerated>" {
 			clientPath := s.toClientPath(loc.File)
-			stackFrame.Source = dap.Source{Name: filepath.Base(clientPath), Path: clientPath}
+			stackFrame.Source = &dap.Source{Name: filepath.Base(clientPath), Path: clientPath}
 		}
 		stackFrame.Column = 0
 
@@ -2142,11 +2246,7 @@ func (s *Session) onVariablesRequest(request *dap.VariablesRequest) {
 		children = append(children, named...)
 	}
 	if request.Arguments.Filter == "indexed" || request.Arguments.Filter == "" {
-		indexed, err := s.childrenToDAPVariables(v)
-		if err != nil {
-			s.sendErrorResponse(request.Request, UnableToLookupVariable, "Unable to lookup variable", err.Error())
-			return
-		}
+		indexed := s.childrenToDAPVariables(v)
 		children = append(children, indexed...)
 	}
 	response := &dap.VariablesResponse{
@@ -2192,7 +2292,7 @@ func getIndexedVariableCount(v *proc.Variable) int {
 }
 
 // childrenToDAPVariables returns the DAP presentation of the referenced variable's children.
-func (s *Session) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variable, error) {
+func (s *Session) childrenToDAPVariables(v *fullyQualifiedVariable) []dap.Variable {
 	// TODO(polina): consider convertVariableToString instead of convertVariable
 	// and avoid unnecessary creation of variable handles when this is called to
 	// compute evaluate names when this is called from onSetVariableRequest.
@@ -2340,7 +2440,7 @@ func (s *Session) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Varia
 			}
 		}
 	}
-	return children, nil
+	return children
 }
 
 func getNamedVariableCount(v *proc.Variable) int {
@@ -2485,6 +2585,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 			value += fmt.Sprintf(" - FAILED TO LOAD: %s", err)
 		} else {
 			v.Children = vLoaded.Children
+			v.Value = vLoaded.Value
 			value = api.ConvertVar(v).SinglelineString()
 		}
 		return value
@@ -2492,7 +2593,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 
 	switch v.Kind {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		n, _ := strconv.ParseUint(api.ConvertVar(v).Value, 10, 64)
+		n, _ := strconv.ParseUint(api.ExtractIntValue(api.ConvertVar(v).Value), 10, 64)
 		value = fmt.Sprintf("%s = %#x", value, n)
 	case reflect.UnsafePointer:
 		// Skip child reference
@@ -2500,7 +2601,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 		if v.DwarfType != nil && len(v.Children) > 0 && v.Children[0].Addr != 0 && v.Children[0].Kind != reflect.Invalid {
 			if v.Children[0].OnlyAddr { // Not loaded
 				if v.Addr == 0 {
-					// This is equvalent to the following with the cli:
+					// This is equivalent to the following with the cli:
 					//    (dlv) p &a7
 					//    (**main.FooBar)(0xc0000a3918)
 					//
@@ -2600,7 +2701,7 @@ func (s *Session) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr 
 	return value, variablesReference
 }
 
-// onEvaluateRequest handles 'evalute' requests.
+// onEvaluateRequest handles 'evaluate' requests.
 // This is a mandatory request to support.
 // Support the following expressions:
 //
@@ -2730,6 +2831,7 @@ func (s *Session) doCall(goid, frame int, expr string) (*api.DebuggerState, []*p
 		GoroutineID:          int64(goid),
 	}, nil)
 	if processExited(state, err) {
+		s.preTerminatedWG.Wait()
 		e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
 		s.send(e)
 		return nil, nil, errors.New("terminated")
@@ -2832,10 +2934,7 @@ func (s *Session) onReverseContinueRequest(request *dap.ReverseContinueRequest, 
 
 // computeEvaluateName finds the named child, and computes its evaluate name.
 func (s *Session) computeEvaluateName(v *fullyQualifiedVariable, cname string) (string, error) {
-	children, err := s.childrenToDAPVariables(v)
-	if err != nil {
-		return "", err
-	}
+	children := s.childrenToDAPVariables(v)
 	for _, c := range children {
 		if c.Name == cname {
 			if c.EvaluateName != "" {
@@ -2887,7 +2986,7 @@ func (s *Session) onSetVariableRequest(request *dap.SetVariableRequest) {
 	}
 
 	if useFnCall {
-		// TODO(hyangah): function call injection currentlly allows to assign return values of
+		// TODO(hyangah): function call injection currently allows to assign return values of
 		// a function call to variables. So, curious users would find set variable
 		// on string would accept expression like `fn()`.
 		if state, retVals, err := s.doCall(goid, frame, fmt.Sprintf("%v=%v", evaluateName, arg.Value)); err != nil {
@@ -2928,7 +3027,7 @@ func (s *Session) onSetVariableRequest(request *dap.SetVariableRequest) {
 	// to update the variable/watch sections if necessary.
 	//
 	// More complicated situation is when the set variable involves call
-	// injection - after the injected call is completed, the debugee can
+	// injection - after the injected call is completed, the debuggee can
 	// be in a completely different state (see the note in doCall) due to
 	// how the call injection is implemented. Ideally, we need to also refresh
 	// the stack frames but that is complicated. For now we don't try to actively
@@ -3054,7 +3153,7 @@ func (s *Session) onDisassembleRequest(request *dap.DisassembleRequest) {
 		}
 		// Only set the location on the first instruction for a given line.
 		if instruction.Loc.File != lastFile || instruction.Loc.Line != lastLine {
-			instructions[i].Location = dap.Source{Path: instruction.Loc.File}
+			instructions[i].Location = &dap.Source{Path: instruction.Loc.File}
 			instructions[i].Line = instruction.Loc.Line
 			lastFile, lastLine = instruction.Loc.File, instruction.Loc.Line
 		}
@@ -3136,7 +3235,7 @@ func alignPCs(bi *proc.BinaryInfo, start, end uint64) (uint64, uint64) {
 	// Handle start values:
 	fn := bi.PCToFunc(start)
 	if fn != nil {
-		// start is in a funcition.
+		// start is in a function.
 		start = fn.Entry
 	} else if b, pc := checkOutOfAddressSpace(start, bi); b {
 		start = pc
@@ -3151,7 +3250,7 @@ func alignPCs(bi *proc.BinaryInfo, start, end uint64) (uint64, uint64) {
 
 	// Handle end values:
 	if fn := bi.PCToFunc(end); fn != nil {
-		// end is in a funcition.
+		// end is in a function.
 		end = fn.End
 	} else if b, pc := checkOutOfAddressSpace(end, bi); b {
 		end = pc
@@ -3261,6 +3360,7 @@ func (s *Session) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
 	}
 
 	if includeStackTrace {
+		body.Details = &dap.ExceptionDetails{}
 		frames, err := s.stacktrace(goroutineID, g)
 		if err != nil {
 			body.Details.StackTrace = fmt.Sprintf("Error getting stack trace: %s", err.Error())
@@ -3329,9 +3429,11 @@ func (s *Session) sendErrorResponseWithOpts(request dap.Request, id int, summary
 	er.RequestSeq = request.Seq
 	er.Success = false
 	er.Message = summary
-	er.Body.Error.Id = id
-	er.Body.Error.Format = fmt.Sprintf("%s: %s", summary, details)
-	er.Body.Error.ShowUser = showUser
+	er.Body.Error = &dap.ErrorMessage{
+		Id:       id,
+		Format:   fmt.Sprintf("%s: %s", summary, details),
+		ShowUser: showUser,
+	}
 	s.config.log.Debug(er.Body.Error.Format)
 	s.send(er)
 }
@@ -3355,8 +3457,10 @@ func (s *Session) sendInternalErrorResponse(seq int, details string) {
 	er.RequestSeq = seq
 	er.Success = false
 	er.Message = "Internal Error"
-	er.Body.Error.Id = InternalError
-	er.Body.Error.Format = fmt.Sprintf("%s: %s", er.Message, details)
+	er.Body.Error = &dap.ErrorMessage{
+		Id:     InternalError,
+		Format: fmt.Sprintf("%s: %s", er.Message, details),
+	}
 	s.config.log.Debug(er.Body.Error.Format)
 	s.send(er)
 }
@@ -3463,7 +3567,7 @@ func (s *Session) resumeOnce(command string, allowNextStateChange chan struct{})
 // termination, error, breakpoint, etc, when an appropriate
 // event needs to be sent to the client. allowNextStateChange is
 // a channel that will be closed to signal that an
-// asynchornous command has completed setup or was interrupted
+// asynchronous command has completed setup or was interrupted
 // due to an error, so the server is ready to receive new requests.
 func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange chan struct{}) {
 	state, err := s.runUntilStop(command, allowNextStateChange)
@@ -3474,6 +3578,7 @@ func (s *Session) runUntilStopAndNotify(command string, allowNextStateChange cha
 	}
 
 	if processExited(state, err) {
+		s.preTerminatedWG.Wait()
 		s.send(&dap.TerminatedEvent{Event: *newEvent("terminated")})
 		return
 	}
@@ -3676,7 +3781,7 @@ func (s *Session) logBreakpointMessage(bp *api.Breakpoint, goid int64) bool {
 			Body: dap.OutputEventBody{
 				Category: "stdout",
 				Output:   fmt.Sprintf("> [Go %d]: %s\n", goid, msg),
-				Source: dap.Source{
+				Source: &dap.Source{
 					Path: s.toClientPath(bp.File),
 				},
 				Line: bp.Line,

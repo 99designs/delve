@@ -19,6 +19,8 @@ var ErrNotExecutable = errors.New("not an executable file")
 type DebuggerState struct {
 	// PID of the process we are debugging.
 	Pid int
+	// Command line of the process we are debugging.
+	TargetCommandLine string
 	// Running is true if the process is running and no other information can be collected.
 	Running bool
 	// Recording is true if the process is currently being recorded and no other
@@ -90,6 +92,8 @@ type Breakpoint struct {
 	// FunctionName is the name of the function at the current breakpoint, and
 	// may not always be available.
 	FunctionName string `json:"functionName,omitempty"`
+	// ExprString is the string that will be used to set a suspended breakpoint.
+	ExprString string
 
 	// Breakpoint condition
 	Cond string
@@ -405,7 +409,7 @@ type DebuggerCommand struct {
 	// UnsafeCall disables parameter escape checking for function calls.
 	// Go objects can be allocated on the stack or on the heap. Heap objects
 	// can be used by any goroutine; stack objects can only be used by the
-	// goroutine that owns the stack they are allocated on and can not surivive
+	// goroutine that owns the stack they are allocated on and can not survive
 	// the stack frame of allocation.
 	// The Go compiler will use escape analysis to determine whether to
 	// allocate an object on the stack or the heap.
@@ -448,7 +452,7 @@ const (
 	ReverseStep = "reverseStep"
 	// StepOut continues to the return address of the current function
 	StepOut = "stepOut"
-	// ReverseStepOut continues backward to the calle rof the current function.
+	// ReverseStepOut continues backward to the caller of the current function.
 	ReverseStepOut = "reverseStepOut"
 	// StepInstruction continues for exactly 1 cpu instruction.
 	StepInstruction = "stepInstruction"
@@ -569,8 +573,9 @@ type Checkpoint struct {
 
 // Image represents a loaded shared object (go plugin or shared library)
 type Image struct {
-	Path    string
-	Address uint64
+	Path      string
+	Address   uint64
+	LoadError string
 }
 
 // Ancestor represents a goroutine ancestor
@@ -630,14 +635,15 @@ type ListGoroutinesFilter struct {
 type GoroutineField uint8
 
 const (
-	GoroutineFieldNone  GoroutineField = iota
-	GoroutineCurrentLoc                // the goroutine's CurrentLoc
-	GoroutineUserLoc                   // the goroutine's UserLoc
-	GoroutineGoLoc                     // the goroutine's GoStatementLoc
-	GoroutineStartLoc                  // the goroutine's StartLoc
-	GoroutineLabel                     // the goroutine's label
-	GoroutineRunning                   // the goroutine is running
-	GoroutineUser                      // the goroutine is a user goroutine
+	GoroutineFieldNone        GoroutineField = iota
+	GoroutineCurrentLoc                      // the goroutine's CurrentLoc
+	GoroutineUserLoc                         // the goroutine's UserLoc
+	GoroutineGoLoc                           // the goroutine's GoStatementLoc
+	GoroutineStartLoc                        // the goroutine's StartLoc
+	GoroutineLabel                           // the goroutine's label
+	GoroutineRunning                         // the goroutine is running
+	GoroutineUser                            // the goroutine is a user goroutine
+	GoroutineWaitingOnChannel                // the goroutine is waiting on the channel specified by the argument
 )
 
 // GoroutineGroup represents a group of goroutines in the return value of
@@ -654,4 +660,11 @@ type GoroutineGroupingOptions struct {
 	GroupByKey      string
 	MaxGroupMembers int
 	MaxGroups       int
+}
+
+// Target represents a debugging target.
+type Target struct {
+	Pid           int
+	CmdLine       string
+	CurrentThread *Thread
 }

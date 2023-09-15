@@ -41,7 +41,8 @@ type Target struct {
 	proc   ProcessInternal
 	recman RecordingManipulationInternal
 
-	pid int
+	pid     int
+	CmdLine string
 
 	// StopReason describes the reason why the target process is stopped.
 	// A process could be stopped for multiple simultaneous reasons, in which
@@ -160,7 +161,7 @@ func DisableAsyncPreemptEnv() []string {
 
 // newTarget returns an initialized Target object.
 // The p argument can optionally implement the RecordingManipulation interface.
-func (grp *TargetGroup) newTarget(p ProcessInternal, pid int, currentThread Thread, path string) (*Target, error) {
+func (grp *TargetGroup) newTarget(p ProcessInternal, pid int, currentThread Thread, path, cmdline string) (*Target, error) {
 	entryPoint, err := p.EntryPoint()
 	if err != nil {
 		return nil, err
@@ -182,6 +183,7 @@ func (grp *TargetGroup) newTarget(p ProcessInternal, pid int, currentThread Thre
 		fncallForG:    make(map[int64]*callInjection),
 		currentThread: currentThread,
 		pid:           pid,
+		CmdLine:       cmdline,
 	}
 
 	if recman, ok := p.(RecordingManipulationInternal); ok {
@@ -294,53 +296,31 @@ func (t *Target) SelectedGoroutine() *G {
 }
 
 // SwitchGoroutine will change the selected and active goroutine.
-func (p *Target) SwitchGoroutine(g *G) error {
-	if ok, err := p.Valid(); !ok {
+func (t *Target) SwitchGoroutine(g *G) error {
+	if ok, err := t.Valid(); !ok {
 		return err
 	}
 	if g == nil {
 		return nil
 	}
 	if g.Thread != nil {
-		return p.SwitchThread(g.Thread.ThreadID())
+		return t.SwitchThread(g.Thread.ThreadID())
 	}
-	p.selectedGoroutine = g
+	t.selectedGoroutine = g
 	return nil
 }
 
 // SwitchThread will change the selected and active thread.
-func (p *Target) SwitchThread(tid int) error {
-	if ok, err := p.Valid(); !ok {
+func (t *Target) SwitchThread(tid int) error {
+	if ok, err := t.Valid(); !ok {
 		return err
 	}
-	if th, ok := p.FindThread(tid); ok {
-		p.currentThread = th
-		p.selectedGoroutine, _ = GetG(p.CurrentThread())
+	if th, ok := t.FindThread(tid); ok {
+		t.currentThread = th
+		t.selectedGoroutine, _ = GetG(t.CurrentThread())
 		return nil
 	}
 	return fmt.Errorf("thread %d does not exist", tid)
-}
-
-// detach will detach the target from the underlying process.
-// This means the debugger will no longer receive events from the process
-// we were previously debugging.
-// If kill is true then the process will be killed when we detach.
-func (t *Target) detach(kill bool) error {
-	if !kill {
-		if t.asyncPreemptChanged {
-			setAsyncPreemptOff(t, t.asyncPreemptOff)
-		}
-		for _, bp := range t.Breakpoints().M {
-			if bp != nil {
-				err := t.ClearBreakpoint(bp.Addr)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	t.StopReason = StopUnknown
-	return t.proc.Detach(kill)
 }
 
 // setAsyncPreemptOff enables or disables async goroutine preemption by
@@ -354,8 +334,12 @@ func setAsyncPreemptOff(p *Target, v int64) {
 	scope := globalScope(p, p.BinInfo(), p.BinInfo().Images[0], p.Memory())
 	// +rtype -var debug anytype
 	debugv, err := scope.findGlobal("runtime", "debug")
-	if err != nil || debugv.Unreadable != nil {
-		logger.Warnf("could not find runtime/debug variable (or unreadable): %v %v", err, debugv.Unreadable)
+	if err != nil {
+		logger.Warnf("could not find runtime/debug variable (or unreadable): %v", err)
+		return
+	}
+	if debugv.Unreadable != nil {
+		logger.Warnf("runtime/debug variable unreadable: %v", err, debugv.Unreadable)
 		return
 	}
 	asyncpreemptoffv, err := debugv.structMember("asyncpreemptoff") // +rtype int32
@@ -394,20 +378,18 @@ func (t *Target) createUnrecoveredPanicBreakpoint() {
 
 // createFatalThrowBreakpoint creates the a breakpoint as runtime.fatalthrow.
 func (t *Target) createFatalThrowBreakpoint() {
-	fatalpcs, err := FindFunctionLocation(t.Process, "runtime.throw", 0)
-	if err == nil {
-		bp, err := t.SetBreakpoint(fatalThrowID, fatalpcs[0], UserBreakpoint, nil)
+	setFatalThrow := func(pcs []uint64, err error) {
 		if err == nil {
-			bp.Logical.Name = FatalThrow
+			bp, err := t.SetBreakpoint(fatalThrowID, pcs[0], UserBreakpoint, nil)
+			if err == nil {
+				bp.Logical.Name = FatalThrow
+			}
 		}
 	}
-	fatalpcs, err = FindFunctionLocation(t.Process, "runtime.fatal", 0)
-	if err == nil {
-		bp, err := t.SetBreakpoint(fatalThrowID, fatalpcs[0], UserBreakpoint, nil)
-		if err == nil {
-			bp.Logical.Name = FatalThrow
-		}
-	}
+	setFatalThrow(FindFunctionLocation(t.Process, "runtime.throw", 0))
+	setFatalThrow(FindFunctionLocation(t.Process, "runtime.fatal", 0))
+	setFatalThrow(FindFunctionLocation(t.Process, "runtime.winthrow", 0))
+	setFatalThrow(FindFunctionLocation(t.Process, "runtime.fatalsignal", 0))
 }
 
 // createPluginOpenBreakpoint creates a breakpoint at the return instruction
@@ -451,8 +433,13 @@ func (t *Target) GetBufferedTracepoints() []*UProbeTraceResult {
 		v.Addr = ip.Addr
 		v.Kind = ip.Kind
 
+		if v.RealType == nil {
+			v.Unreadable = errors.New("type not supported by ebpf")
+			return v
+		}
+
 		cachedMem := CreateLoadedCachedMemory(ip.Data)
-		compMem, _ := CreateCompositeMemory(cachedMem, t.BinInfo().Arch, op.DwarfRegisters{}, ip.Pieces)
+		compMem, _ := CreateCompositeMemory(cachedMem, t.BinInfo().Arch, op.DwarfRegisters{}, ip.Pieces, ip.RealType.Common().ByteSize)
 		v.mem = compMem
 
 		// Load the value here so that we don't have to export
@@ -481,16 +468,16 @@ func (t *Target) GetBufferedTracepoints() []*UProbeTraceResult {
 
 // ResumeNotify specifies a channel that will be closed the next time
 // Continue finishes resuming the targets.
-func (t *TargetGroup) ResumeNotify(ch chan<- struct{}) {
-	t.cctx.ResumeChan = ch
+func (grp *TargetGroup) ResumeNotify(ch chan<- struct{}) {
+	grp.cctx.ResumeChan = ch
 }
 
 // RequestManualStop attempts to stop all the processes' threads.
-func (t *TargetGroup) RequestManualStop() error {
-	t.cctx.StopMu.Lock()
-	defer t.cctx.StopMu.Unlock()
-	t.cctx.manualStopRequested = true
-	return t.Selected.proc.RequestManualStop(t.cctx)
+func (grp *TargetGroup) RequestManualStop() error {
+	grp.cctx.StopMu.Lock()
+	defer grp.cctx.StopMu.Unlock()
+	grp.cctx.manualStopRequested = true
+	return grp.Selected.proc.RequestManualStop(grp.cctx)
 }
 
 const (
@@ -504,7 +491,7 @@ const (
 // This caching is primarily done so that registerized variables don't get a
 // different address every time they are evaluated, which would be confusing
 // and leak memory.
-func (t *Target) newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters, pieces []op.Piece, descr *locationExpr) (int64, *compositeMemory, error) {
+func (t *Target) newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters, pieces []op.Piece, descr *locationExpr, size int64) (int64, *compositeMemory, error) {
 	var key string
 	if regs.CFA != 0 && len(pieces) > 0 {
 		// key is created by concatenating the location expression with the CFA,
@@ -519,7 +506,7 @@ func (t *Target) newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters
 		}
 	}
 
-	cmem, err := newCompositeMemory(mem, t.BinInfo().Arch, regs, pieces)
+	cmem, err := newCompositeMemory(mem, t.BinInfo().Arch, regs, pieces, size)
 	if err != nil {
 		return 0, cmem, err
 	}
@@ -587,7 +574,7 @@ func (t *Target) dwrapUnwrap(fn *Function) *Function {
 	return fn
 }
 
-func (t *Target) pluginOpenCallback(Thread) bool {
+func (t *Target) pluginOpenCallback(Thread, *Target) (bool, error) {
 	logger := logflags.DebuggerLogger()
 	for _, lbp := range t.Breakpoints().Logical {
 		if isSuspended(t, lbp) {
@@ -599,7 +586,7 @@ func (t *Target) pluginOpenCallback(Thread) bool {
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 func isSuspended(t *Target, lbp *LogicalBreakpoint) bool {
@@ -648,4 +635,10 @@ func (*dummyRecordingManipulation) ClearCheckpoint(int) error { return ErrNotRec
 // recorded traces.
 func (*dummyRecordingManipulation) Restart(*ContinueOnceContext, string) (Thread, error) {
 	return nil, ErrNotRecorded
+}
+
+var ErrWaitForNotImplemented = errors.New("waitfor not implemented")
+
+func (waitFor *WaitFor) Valid() bool {
+	return waitFor != nil && waitFor.Name != ""
 }

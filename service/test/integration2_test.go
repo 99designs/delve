@@ -85,7 +85,9 @@ func startServer(name string, buildFlags protest.BuildFlags, t *testing.T, redir
 			Packages:       []string{fixture.Source},
 			BuildFlags:     "", // build flags can be an empty string here because the only test that uses it, does not set special flags.
 			ExecuteKind:    debugger.ExecutingGeneratedFile,
-			Redirects:      redirects,
+			Stdin:          redirects[0],
+			Stdout:         proc.OutputRedirect{Path: redirects[1]},
+			Stderr:         proc.OutputRedirect{Path: redirects[2]},
 		},
 	})
 	if err := server.Run(); err != nil {
@@ -611,7 +613,7 @@ func TestClientServer_toggleAmendedBreakpoint(t *testing.T) {
 			t.Fatal(err)
 		}
 		if amended.Cond == "" {
-			t.Fatal("breakpoint amendedments not preserved after toggle")
+			t.Fatal("breakpoint amendments not preserved after toggle")
 		}
 	})
 }
@@ -863,7 +865,7 @@ func TestClientServer_traceContinue(t *testing.T) {
 					t.Fatalf("No goroutine information")
 				}
 
-				if len(bpi.Stacktrace) <= 0 {
+				if len(bpi.Stacktrace) == 0 {
 					t.Fatalf("No stacktrace\n")
 				}
 
@@ -944,6 +946,9 @@ func TestClientServer_traceContinue2(t *testing.T) {
 }
 
 func TestClientServer_FindLocations(t *testing.T) {
+	if runtime.GOARCH == "ppc64le" && buildMode == "pie" {
+		t.Skip("pie mode broken on ppc64le")
+	}
 	withTestClient2("locationsprog", t, func(c service.Client) {
 		someFunctionCallAddr := findLocationHelper(t, c, "locationsprog.go:26", false, 1, 0)[0]
 		someFunctionLine1 := findLocationHelper(t, c, "locationsprog.go:27", false, 1, 0)[0]
@@ -992,14 +997,14 @@ func TestClientServer_FindLocations(t *testing.T) {
 
 		findLocationHelper(t, c, `*amap["k"]`, false, 1, findLocationHelper(t, c, `amap["k"]`, false, 1, 0)[0])
 
-		locsNoSubst, _ := c.FindLocation(api.EvalScope{GoroutineID: -1}, "_fixtures/locationsprog.go:35", false, nil)
+		locsNoSubst, _, _ := c.FindLocation(api.EvalScope{GoroutineID: -1}, "_fixtures/locationsprog.go:35", false, nil)
 		sep := "/"
 		if strings.Contains(locsNoSubst[0].File, "\\") {
 			sep = "\\"
 		}
 		substRules := [][2]string{{strings.Replace(locsNoSubst[0].File, "locationsprog.go", "", 1), strings.Replace(locsNoSubst[0].File, "_fixtures"+sep+"locationsprog.go", "nonexistent", 1)}}
 		t.Logf("substitute rules: %q -> %q", substRules[0][0], substRules[0][1])
-		locsSubst, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "nonexistent/locationsprog.go:35", false, substRules)
+		locsSubst, _, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "nonexistent/locationsprog.go:35", false, substRules)
 		if err != nil {
 			t.Fatalf("FindLocation(locationsprog.go:35) with substitute rules: %v", err)
 		}
@@ -1109,7 +1114,7 @@ func TestClientServer_FindLocations(t *testing.T) {
 }
 
 func findLocationHelper2(t *testing.T, c service.Client, loc string, checkLoc *api.Location) *api.Location {
-	locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, loc, false, nil)
+	locs, _, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, loc, false, nil)
 	if err != nil {
 		t.Fatalf("FindLocation(%q) -> error %v", loc, err)
 	}
@@ -1207,6 +1212,9 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 	protest.AllowRecording(t)
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		t.Skip("cgo doesn't work on darwin/arm64")
+	}
+	if runtime.GOARCH == "ppc64le" && buildMode == "pie" {
+		t.Skip("pie mode broken on ppc64le")
 	}
 
 	lenient := false
@@ -1352,7 +1360,7 @@ func TestIssue355(t *testing.T) {
 		assertError(err, t, "ListGoroutines()")
 		_, err = c.Stacktrace(gid, 10, 0, &normalLoadConfig)
 		assertError(err, t, "Stacktrace()")
-		_, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1", false, nil)
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1", false, nil)
 		assertError(err, t, "FindLocation()")
 		_, err = c.DisassemblePC(api.EvalScope{GoroutineID: -1}, 0x40100, api.IntelFlavour)
 		assertError(err, t, "DisassemblePC()")
@@ -1360,7 +1368,10 @@ func TestIssue355(t *testing.T) {
 }
 
 func TestDisasm(t *testing.T) {
-	// Tests that disassembling by PC, range, and current PC all yeld similar results
+	if runtime.GOARCH == "ppc64le" {
+		t.Skip("skipped on ppc64le: broken")
+	}
+	// Tests that disassembling by PC, range, and current PC all yield similar results
 	// Tests that disassembly by current PC will return a disassembly containing the instruction at PC
 	// Tests that stepping on a calculated CALL instruction will yield a disassembly that contains the
 	// effective destination of the CALL instruction
@@ -1369,7 +1380,7 @@ func TestDisasm(t *testing.T) {
 		state := <-ch
 		assertNoError(state.Err, t, "Continue()")
 
-		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", false, nil)
+		locs, _, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", false, nil)
 		assertNoError(err, t, "FindLocation()")
 		if len(locs) != 1 {
 			t.Fatalf("wrong number of locations for main.main: %d", len(locs))
@@ -1628,7 +1639,7 @@ func TestTypesCommand(t *testing.T) {
 func TestIssue406(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestClient2("issue406", t, func(c service.Client) {
-		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "issue406.go:146", false, nil)
+		locs, _, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "issue406.go:146", false, nil)
 		assertNoError(err, t, "FindLocation()")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{Addr: locs[0].PC})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -1962,7 +1973,7 @@ func TestClientServerConsistentExit(t *testing.T) {
 
 		// Ensure future commands also return the correct exit status.
 		// Previously there was a bug where the command which prompted the
-		// process to exit (continue, next, etc...) would return the corrent
+		// process to exit (continue, next, etc...) would return the current
 		// exit status but subsequent commands would return an incorrect exit
 		// status of 0. To test this we simply repeat the 'next' command and
 		// ensure we get the correct response again.
@@ -2188,7 +2199,7 @@ func TestAncestors(t *testing.T) {
 	defer os.Setenv("GODEBUG", savedGodebug)
 	withTestClient2("testnextprog", t, func(c service.Client) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.testgoroutine", Line: -1})
-		assertNoError(err, t, "CreateBreakpoin")
+		assertNoError(err, t, "CreateBreakpoint")
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 		ancestors, err := c.Ancestors(-1, 1000, 1000)
@@ -2242,7 +2253,7 @@ func TestUnknownMethodCall(t *testing.T) {
 func TestIssue1703(t *testing.T) {
 	// Calling Disassemble when there is no current goroutine should work.
 	withTestClient2("testnextprog", t, func(c service.Client) {
-		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", true, nil)
+		locs, _, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", true, nil)
 		assertNoError(err, t, "FindLocation")
 		t.Logf("FindLocation: %#v", locs)
 		text, err := c.DisassemblePC(api.EvalScope{GoroutineID: -1}, locs[0].PC, api.IntelFlavour)
@@ -2259,7 +2270,7 @@ func TestRerecord(t *testing.T) {
 	withTestClient2("testrerecord", t, func(c service.Client) {
 		fp := testProgPath(t, "testrerecord")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 10})
-		assertNoError(err, t, "CreateBreakpoin")
+		assertNoError(err, t, "CreateBreakpoint")
 
 		gett := func() int {
 			state := <-c.Continue()
@@ -2531,7 +2542,7 @@ func TestToggleBreakpointRestart(t *testing.T) {
 }
 
 func TestStopServerWithClosedListener(t *testing.T) {
-	// Checks that the error erturned by listener.Accept() is ignored when we
+	// Checks that the error returned by listener.Accept() is ignored when we
 	// are trying to shutdown. See issue #1633.
 	if testBackend == "rr" || buildMode == "pie" {
 		t.Skip("N/A")
@@ -2566,7 +2577,7 @@ func TestGoroutinesGrouping(t *testing.T) {
 	withTestClient2("goroutinegroup", t, func(c service.Client) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue")
-		_, ggrp, _, _, err := c.ListGoroutinesWithFilter(0, 0, nil, &api.GoroutineGroupingOptions{GroupBy: api.GoroutineLabel, GroupByKey: "name", MaxGroupMembers: 5, MaxGroups: 10})
+		_, ggrp, _, _, err := c.ListGoroutinesWithFilter(0, 0, nil, &api.GoroutineGroupingOptions{GroupBy: api.GoroutineLabel, GroupByKey: "name", MaxGroupMembers: 5, MaxGroups: 10}, nil)
 		assertNoError(err, t, "ListGoroutinesWithFilter (group by label)")
 		t.Logf("%#v\n", ggrp)
 		if len(ggrp) < 5 {
@@ -2579,7 +2590,7 @@ func TestGoroutinesGrouping(t *testing.T) {
 				break
 			}
 		}
-		gs, _, _, _, err := c.ListGoroutinesWithFilter(0, 0, []api.ListGoroutinesFilter{{Kind: api.GoroutineLabel, Arg: "name="}}, nil)
+		gs, _, _, _, err := c.ListGoroutinesWithFilter(0, 0, []api.ListGoroutinesFilter{{Kind: api.GoroutineLabel, Arg: "name="}}, nil, nil)
 		assertNoError(err, t, "ListGoroutinesWithFilter (filter unnamed)")
 		if len(gs) != unnamedCount {
 			t.Errorf("wrong number of goroutines returned by filter: %d (expected %d)\n", len(gs), unnamedCount)
@@ -2856,6 +2867,9 @@ func assertLine(t *testing.T, state *api.DebuggerState, file string, lineno int)
 }
 
 func TestPluginSuspendedBreakpoint(t *testing.T) {
+	if runtime.GOARCH == "ppc64le" {
+		t.Skip("skipped on ppc64le: broken")
+	}
 	// Tests that breakpoints created in a suspended state will be enabled automatically when a plugin is loaded.
 	pluginFixtures := protest.WithPlugins(t, protest.AllNonOptimized, "plugin1/", "plugin2/")
 	dir, err := filepath.Abs(protest.FindFixturesDir())
@@ -2973,7 +2987,7 @@ func TestClientServer_createBreakpointWithID(t *testing.T) {
 }
 
 func TestClientServer_autoBreakpoints(t *testing.T) {
-	// Check that unrecoverd-panic and fatal-throw breakpoints are visible in
+	// Check that unrecovered-panic and fatal-throw breakpoints are visible in
 	// the breakpoint list.
 	protest.AllowRecording(t)
 	withTestClient2("math", t, func(c service.Client) {
@@ -2988,6 +3002,99 @@ func TestClientServer_autoBreakpoints(t *testing.T) {
 		}
 		if n != 2 {
 			t.Error("automatic breakpoints not found")
+		}
+	})
+}
+
+func TestClientServer_breakpointOnFuncWithABIWrapper(t *testing.T) {
+	// Setting a breakpoint on an assembly function that has an ABI
+	// compatibility wrapper should end up setting a breakpoint on the real
+	// function (also setting a breakpoint on the wrapper is fine).
+	// Issue #3296
+	protest.AllowRecording(t)
+	withTestClient2("math", t, func(c service.Client) {
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "runtime.schedinit"})
+		assertNoError(err, t, "CreateBreakpoint()")
+		t.Log(bp)
+
+		found := false
+		for _, pc := range bp.Addrs {
+			text, err := c.DisassemblePC(api.EvalScope{}, pc, api.IntelFlavour)
+			assertNoError(err, t, fmt.Sprint("DisassemblePC", pc))
+			t.Log("First instruction for", pc, text[0])
+			if strings.HasSuffix(text[0].Loc.File, "runtime/proc.go") {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("breakpoint not set on the runtime/proc.go function")
+		}
+	})
+}
+
+var waitReasonStrings = [...]string{
+	"",
+	"GC assist marking",
+	"IO wait",
+	"chan receive (nil chan)",
+	"chan send (nil chan)",
+	"dumping heap",
+	"garbage collection",
+	"garbage collection scan",
+	"panicwait",
+	"select",
+	"select (no cases)",
+	"GC assist wait",
+	"GC sweep wait",
+	"GC scavenge wait",
+	"chan receive",
+	"chan send",
+	"finalizer wait",
+	"force gc (idle)",
+	"semacquire",
+	"sleep",
+	"sync.Cond.Wait",
+	"timer goroutine (idle)",
+	"trace reader (blocked)",
+	"wait for GC cycle",
+	"GC worker (idle)",
+	"preempted",
+	"debug call",
+}
+
+func TestClientServer_chanGoroutines(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestClient2("changoroutines", t, func(c service.Client) {
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue()")
+
+		countRecvSend := func(gs []*api.Goroutine) (recvq, sendq int) {
+			for _, g := range gs {
+				t.Logf("\tID: %d WaitReason: %s\n", g.ID, waitReasonStrings[g.WaitReason])
+				switch waitReasonStrings[g.WaitReason] {
+				case "chan send":
+					sendq++
+				case "chan receive":
+					recvq++
+				}
+			}
+			return
+		}
+
+		gs, _, _, _, err := c.ListGoroutinesWithFilter(0, 100, []api.ListGoroutinesFilter{{Kind: api.GoroutineWaitingOnChannel, Arg: "blockingchan1"}}, nil, &api.EvalScope{GoroutineID: -1})
+		assertNoError(err, t, "ListGoroutinesWithFilter(blockingchan1)")
+		t.Logf("blockingchan1 gs:")
+		recvq, sendq := countRecvSend(gs)
+		if len(gs) != 2 || recvq != 0 || sendq != 2 {
+			t.Error("wrong number of goroutines for blockingchan1")
+		}
+
+		gs, _, _, _, err = c.ListGoroutinesWithFilter(0, 100, []api.ListGoroutinesFilter{{Kind: api.GoroutineWaitingOnChannel, Arg: "blockingchan2"}}, nil, &api.EvalScope{GoroutineID: -1})
+		assertNoError(err, t, "ListGoroutinesWithFilter(blockingchan2)")
+		t.Logf("blockingchan2 gs:")
+		recvq, sendq = countRecvSend(gs)
+		if len(gs) != 1 || recvq != 1 || sendq != 0 {
+			t.Error("wrong number of goroutines for blockingchan2")
 		}
 	})
 }

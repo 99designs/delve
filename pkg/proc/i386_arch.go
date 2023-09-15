@@ -43,7 +43,7 @@ func I386Arch(goos string) *Arch {
 func i386FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *BinaryInfo) *frame.FrameContext {
 	i := bi.Arch
 	if i.sigreturnfn == nil {
-		i.sigreturnfn = bi.LookupFunc["runtime.sigreturn"]
+		i.sigreturnfn = bi.lookupOneFunc("runtime.sigreturn")
 	}
 
 	if fctxt == nil || (i.sigreturnfn != nil && pc >= i.sigreturnfn.Entry && pc < i.sigreturnfn.End) {
@@ -90,7 +90,7 @@ func i386FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *BinaryI
 	}
 
 	if i.crosscall2fn == nil {
-		i.crosscall2fn = bi.LookupFunc["crosscall2"]
+		i.crosscall2fn = bi.lookupOneFunc("crosscall2")
 	}
 
 	// TODO(chainhelen), need to check whether there is a bad frame descriptor like amd64.
@@ -127,8 +127,16 @@ func i386SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 	switch it.frame.Current.Fn.Name {
 	case "runtime.asmcgocall", "runtime.cgocallback_gofunc": // TODO(chainhelen), need to support cgo stacktraces.
 		return false
-	case "runtime.goexit", "runtime.rt0_go", "runtime.mcall":
+	case "runtime.goexit", "runtime.rt0_go":
 		// Look for "top of stack" functions.
+		it.atend = true
+		return true
+
+	case "runtime.mcall":
+		if it.systemstack && it.g != nil {
+			it.switchToGoroutineStack()
+			return true
+		}
 		it.atend = true
 		return true
 
@@ -152,24 +160,15 @@ func i386SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 		it.switchToGoroutineStack()
 		return true
 
-	default:
-		if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.throw" && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
-			// The runtime switches to the system stack in multiple places.
-			// This usually happens through a call to runtime.systemstack but there
-			// are functions that switch to the system stack manually (for example
-			// runtime.morestack).
-			// Since we are only interested in printing the system stack for cgo
-			// calls we switch directly to the goroutine stack if we detect that the
-			// function at the top of the stack is a runtime function.
-			//
-			// The function "runtime.throw" is deliberately excluded from this
-			// because it can end up in the stack during a cgo call and switching to
-			// the goroutine stack will exclude all the C functions from the stack
-			// trace.
+	case "runtime.newstack", "runtime.systemstack":
+		if it.systemstack && it.g != nil {
 			it.switchToGoroutineStack()
 			return true
 		}
 
+		return false
+
+	default:
 		return false
 	}
 }

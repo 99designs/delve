@@ -760,6 +760,9 @@ func alignAddr(addr, align int64) int64 {
 }
 
 func escapeCheck(v *Variable, name string, stack stack) error {
+	if v.Unreadable != nil {
+		return fmt.Errorf("escape check for %s failed, variable unreadable: %v", name, v.Unreadable)
+	}
 	switch v.Kind {
 	case reflect.Ptr:
 		var w *Variable
@@ -1050,7 +1053,7 @@ func readStackVariable(t *Target, thread Thread, regs Registers, off uint64, typ
 func fakeFunctionEntryScope(scope *EvalScope, fn *Function, cfa int64, sp uint64) error {
 	scope.PC = fn.Entry
 	scope.Fn = fn
-	scope.File, scope.Line, _ = scope.BinInfo.PCToLine(fn.Entry)
+	scope.File, scope.Line = scope.BinInfo.EntryLineForFunc(fn)
 
 	scope.Regs.CFA = cfa
 	scope.Regs.Reg(scope.Regs.SPRegNum).Uint64Val = sp
@@ -1124,7 +1127,7 @@ func isCallInjectionStop(t *Target, thread Thread, loc *Location) bool {
 		off = -int64(len(thread.BinInfo().Arch.breakpointInstruction))
 	}
 	text, err := disassembleCurrentInstruction(t, thread, off)
-	if err != nil || len(text) <= 0 {
+	if err != nil || len(text) == 0 {
 		return false
 	}
 	return text[0].IsHardBreak()
@@ -1211,8 +1214,8 @@ func findCallInjectionStateForThread(t *Target, thread Thread) (*G, *callInjecti
 func debugCallFunction(bi *BinaryInfo) (*Function, int) {
 	for version := maxDebugCallVersion; version >= 1; version-- {
 		name := debugCallFunctionNamePrefix2 + "V" + strconv.Itoa(version)
-		fn, ok := bi.LookupFunc[name]
-		if ok && fn != nil {
+		fn := bi.lookupOneFunc(name)
+		if fn != nil {
 			return fn, version
 		}
 	}
@@ -1260,6 +1263,8 @@ func (e fakeEntry) AttrField(attr dwarf.Attr) *dwarf.Field {
 }
 
 func regabiMallocgcWorkaround(bi *BinaryInfo) ([]*godwarf.Tree, error) {
+	ptrToRuntimeType := "*" + bi.runtimeTypeTypename()
+
 	var err1 error
 
 	t := func(name string) godwarf.Type {
@@ -1295,7 +1300,7 @@ func regabiMallocgcWorkaround(bi *BinaryInfo) ([]*godwarf.Tree, error) {
 	case "amd64":
 		r := []*godwarf.Tree{
 			m("size", t("uintptr"), regnum.AMD64_Rax, false),
-			m("typ", t("*runtime._type"), regnum.AMD64_Rbx, false),
+			m("typ", t(ptrToRuntimeType), regnum.AMD64_Rbx, false),
 			m("needzero", t("bool"), regnum.AMD64_Rcx, false),
 			m("~r1", t("unsafe.Pointer"), regnum.AMD64_Rax, true),
 		}
@@ -1303,7 +1308,7 @@ func regabiMallocgcWorkaround(bi *BinaryInfo) ([]*godwarf.Tree, error) {
 	case "arm64":
 		r := []*godwarf.Tree{
 			m("size", t("uintptr"), regnum.ARM64_X0, false),
-			m("typ", t("*runtime._type"), regnum.ARM64_X0+1, false),
+			m("typ", t(ptrToRuntimeType), regnum.ARM64_X0+1, false),
 			m("needzero", t("bool"), regnum.ARM64_X0+2, false),
 			m("~r1", t("unsafe.Pointer"), regnum.ARM64_X0, true),
 		}

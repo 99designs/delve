@@ -63,12 +63,12 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 		if v.Type == "" || len(v.Children) == 0 {
 			fmt.Fprint(buf, "nil")
 		} else if v.Children[0].OnlyAddr && v.Children[0].Addr != 0 {
-			if strings.Contains(v.Type, "/") {
-				fmt.Fprintf(buf, "(%q)(%#x)", v.Type, v.Children[0].Addr)
-			} else {
-				fmt.Fprintf(buf, "(%s)(%#x)", v.Type, v.Children[0].Addr)
-			}
+			v.writePointerTo(buf)
 		} else {
+			if top && newlines && v.Children[0].Addr != 0 {
+				v.writePointerTo(buf)
+				fmt.Fprint(buf, "\n")
+			}
 			fmt.Fprint(buf, "*")
 			v.Children[0].writeTo(buf, false, newlines, includeType, indent, fmtstr)
 		}
@@ -145,6 +145,14 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 	}
 }
 
+func (v *Variable) writePointerTo(buf io.Writer) {
+	if strings.Contains(v.Type, "/") {
+		fmt.Fprintf(buf, "(%q)(%#x)", v.Type, v.Children[0].Addr)
+	} else {
+		fmt.Fprintf(buf, "(%s)(%#x)", v.Type, v.Children[0].Addr)
+	}
+}
+
 func (v *Variable) writeBasicType(buf io.Writer, fmtstr string) {
 	if v.Value == "" && v.Kind != reflect.String {
 		fmt.Fprintf(buf, "(unknown %s)", v.Kind)
@@ -165,7 +173,7 @@ func (v *Variable) writeBasicType(buf io.Writer, fmtstr string) {
 			buf.Write([]byte(v.Value))
 			return
 		}
-		n, _ := strconv.ParseInt(v.Value, 10, 64)
+		n, _ := strconv.ParseInt(ExtractIntValue(v.Value), 10, 64)
 		fmt.Fprintf(buf, fmtstr, n)
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
@@ -173,7 +181,7 @@ func (v *Variable) writeBasicType(buf io.Writer, fmtstr string) {
 			buf.Write([]byte(v.Value))
 			return
 		}
-		n, _ := strconv.ParseUint(v.Value, 10, 64)
+		n, _ := strconv.ParseUint(ExtractIntValue(v.Value), 10, 64)
 		fmt.Fprintf(buf, fmtstr, n)
 
 	case reflect.Float32, reflect.Float64:
@@ -205,6 +213,17 @@ func (v *Variable) writeBasicType(buf io.Writer, fmtstr string) {
 		}
 		fmt.Fprintf(buf, fmtstr, v.Value)
 	}
+}
+
+func ExtractIntValue(s string) string {
+	if s == "" || s[len(s)-1] != ')' {
+		return s
+	}
+	open := strings.LastIndex(s, "(")
+	if open < 0 {
+		return s
+	}
+	return s[open+1 : len(s)-1]
 }
 
 func (v *Variable) writeSliceTo(buf io.Writer, newlines, includeType bool, indent, fmtstr string) {
@@ -449,7 +468,7 @@ func PrettyExamineMemory(address uintptr, memArea []byte, isLittleEndian bool, f
 		cols = 8
 		colFormat = fmt.Sprintf("0x%%0%dx", colBytes*2) // Always keep one leading '0x' for hex.
 	default:
-		return fmt.Sprintf("not supprted format %q\n", string(format))
+		return fmt.Sprintf("not supported format %q\n", string(format))
 	}
 	colFormat += "\t"
 
